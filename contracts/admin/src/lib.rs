@@ -163,6 +163,105 @@ impl AdminContract {
 
         Ok(())
     }
+
+    /// Updates the stored payment contract address.
+    ///
+    /// # Parameters
+    /// - `admin`: the admin address that must be authorized.
+    /// - `payment_contract`: the new payment contract address.
+    ///
+    /// # Errors
+    /// Returns `Error::NotInitialized` if the admin contract has not been initialized,
+    /// and `Error::Unauthorized` if the provided admin address does not match the
+    /// stored admin.
+    pub fn set_payment_contract(
+        env: Env,
+        admin: Address,
+        payment_contract: Address,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        if admin != stored_admin {
+            return Err(Error::Unauthorized);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::PaymentContract, &payment_contract);
+
+        Ok(())
+    }
+
+    /// Updates the stored escrow contract address.
+    ///
+    /// # Parameters
+    /// - `admin`: the admin address that must be authorized.
+    /// - `escrow_contract`: the new escrow contract address.
+    ///
+    /// # Errors
+    /// Returns `Error::NotInitialized` if the admin contract has not been initialized,
+    /// and `Error::Unauthorized` if the provided admin address does not match the
+    /// stored admin.
+    pub fn set_escrow_contract(
+        env: Env,
+        admin: Address,
+        escrow_contract: Address,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        if admin != stored_admin {
+            return Err(Error::Unauthorized);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::EscrowContract, &escrow_contract);
+
+        Ok(())
+    }
+
+    /// Updates the stored refund contract address.
+    ///
+    /// # Parameters
+    /// - `admin`: the admin address that must be authorized.
+    /// - `refund_contract`: the new refund contract address.
+    ///
+    /// # Errors
+    /// Returns `Error::NotInitialized` if the admin contract has not been initialized,
+    /// and `Error::Unauthorized` if the provided admin address does not match the
+    /// stored admin.
+    pub fn set_refund_contract(
+        env: Env,
+        admin: Address,
+        refund_contract: Address,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        if admin != stored_admin {
+            return Err(Error::Unauthorized);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::RefundContract, &refund_contract);
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]

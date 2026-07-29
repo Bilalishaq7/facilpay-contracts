@@ -65,6 +65,7 @@ pub enum PaymentKey {
     PendingSettlement(u64),
     AccumulatedFees,
     LargePaymentCounter,
+    Discount(u64),
 }
 
 pub const MAX_MEMO_VERSIONS: u32 = 10;
@@ -913,6 +914,14 @@ pub struct ChannelOpened {
     pub customer: Address,
     pub merchant: Address,
     pub amount: i128,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChannelToppedUp {
+    pub channel_id: u64,
+    pub amount: i128,
+    pub new_deposited: i128,
 }
 
 #[contractevent]
@@ -3732,11 +3741,31 @@ impl PaymentContract {
             }
         }
 
+        // Subtract any loyalty-point discount redeemed against this payment (#490)
+        let discount: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Payment(PaymentKey::Discount(payment_id)))
+            .unwrap_or(0);
+        let charge_amount = if discount > 0 {
+            env.storage()
+                .instance()
+                .remove(&DataKey::Payment(PaymentKey::Discount(payment_id)));
+            let capped_discount = if discount > payment.amount {
+                payment.amount
+            } else {
+                discount
+            };
+            payment.amount - capped_discount
+        } else {
+            payment.amount
+        };
+
         // Deduct platform fee (if configured) and get net amount for merchant
         let (net_amount, fee_amount) = PaymentContract::deduct_fee(
             env,
             payment_id,
-            payment.amount,
+            charge_amount,
             payment.merchant.clone(),
             &payment.token,
             &payment.customer,
@@ -4192,6 +4221,16 @@ impl PaymentContract {
         env.storage().instance().set(
             &DataKey::Feature(FeatureKey::CustomerLoyaltyBalance(customer.clone())),
             &balance,
+        );
+
+        let existing_discount: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Payment(PaymentKey::Discount(payment_id)))
+            .unwrap_or(0);
+        env.storage().instance().set(
+            &DataKey::Payment(PaymentKey::Discount(payment_id)),
+            &(existing_discount + discount),
         );
 
         Ok(discount)
@@ -10821,6 +10860,74 @@ impl PaymentContract {
         .publish(&env);
 
         Ok(channel_id)
+    }
+
+    /// Tops up an existing open payment channel with additional deposit.
+    ///
+    /// Allows a customer to add funds to a channel that has been drawn down,
+    /// avoiding the need to close and reopen a new channel for continued
+    /// micropayments.
+    ///
+    /// # Arguments
+    /// * `customer` - The channel's customer (must authorize).
+    /// * `channel_id` - The ID of the channel to top up.
+    /// * `amount` - Amount to add to the channel's deposit.
+    ///
+    /// # Returns
+    /// `Ok(())` on success.
+    ///
+    /// # Errors
+    /// Returns an error if the amount is non-positive, the channel is not found,
+    /// the caller is not the channel's customer, the channel is closed, or the
+    /// channel has expired.
+    pub fn top_up_channel(
+        env: Env,
+        customer: Address,
+        channel_id: u64,
+        amount: i128,
+    ) -> Result<(), Error> {
+        customer.require_auth();
+        if amount <= 0 {
+            return Err(Error::Basic(BasicError::InvalidAmount));
+        }
+
+        let mut channel: PaymentChannel = env
+            .storage()
+            .instance()
+            .get(&DataKey::Feature(FeatureKey::PaymentChannel(channel_id)))
+            .ok_or(Error::Feature(FeatureError::ChannelNotFound))?;
+
+        if channel.customer != customer {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+
+        if !channel.open {
+            return Err(Error::Feature(FeatureError::ChannelClosed));
+        }
+
+        if channel.expires_at > 0 && env.ledger().timestamp() > channel.expires_at {
+            return Err(Error::Feature(FeatureError::ChannelExpired));
+        }
+
+        let token_client = token::Client::new(&env, &channel.token);
+        let contract_address = env.current_contract_address();
+        token_client.transfer(&customer, &contract_address, &amount);
+
+        channel.deposited += amount;
+
+        env.storage().instance().set(
+            &DataKey::Feature(FeatureKey::PaymentChannel(channel_id)),
+            &channel,
+        );
+
+        (ChannelToppedUp {
+            channel_id,
+            amount,
+            new_deposited: channel.deposited,
+        })
+        .publish(&env);
+
+        Ok(())
     }
 
     /// Settles a payment channel with a signed off-chain state update.

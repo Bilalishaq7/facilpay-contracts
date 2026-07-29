@@ -7959,6 +7959,12 @@ impl RefundContract {
             return Err(Error::Ext(ExtError::VoucherExpired));
         }
 
+        token::Client::new(&env, &voucher.token).transfer(
+            &env.current_contract_address(),
+            &customer,
+            &voucher.amount,
+        );
+
         voucher.redeemed = true;
         env.storage()
             .instance()
