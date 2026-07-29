@@ -32,6 +32,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Improved documentation coverage to reduce friction for off-chain integrators consuming Soroban events.
 
+- **Split Payment Dust Recipient Guard** — `create_split_payment()` rejects any recipient whose computed share falls below an admin-configured `min_split_amount` floor, preventing dust splits from bloating ledger storage. Enforced via `set_min_split_amount()` / `get_min_split_amount()` (see commit `061aeeb`).
+
 ---
 
 ## [Previous Versions]
