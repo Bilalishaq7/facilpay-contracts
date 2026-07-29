@@ -2516,6 +2516,16 @@ impl RefundContract {
             return Err(Error::Core(CoreError::InvalidAmount));
         }
 
+        let fee_config: Option<ArbitrationFeeConfig> = env
+            .storage()
+            .instance()
+            .get(&ArbitrationKey::ArbitrationFeeConfig);
+        if let Some(ref config) = fee_config {
+            if config.fee_per_case > 0 && fee_amount < config.fee_per_case {
+                return Err(Error::Core(CoreError::InvalidAmount));
+            }
+        }
+
         let counter: u64 = env
             .storage()
             .instance()

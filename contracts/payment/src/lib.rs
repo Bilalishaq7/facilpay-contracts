@@ -3740,6 +3740,7 @@ impl PaymentContract {
             payment.merchant.clone(),
             &payment.token,
             &payment.customer,
+            payment.currency.clone(),
         );
 
         // Check finality delay config (#219)
@@ -7575,6 +7576,7 @@ impl PaymentContract {
         merchant: Address,
         token: &Address,
         customer: &Address,
+        currency: Currency,
     ) -> (i128, i128) {
         let config: Option<FeeConfig> = env
             .storage()
@@ -7587,16 +7589,37 @@ impl PaymentContract {
             Some(c) if !c.active => {
                 return (amount, 0);
             }
-            Some(c) if c.fee_token != *token => {
-                return (amount, 0);
-            }
             Some(c) => c,
         };
-        let record = PaymentContract::get_or_default_merchant_fee_record(env, merchant.clone());
 
+        if !PaymentContract::is_token_allowed(env, token) {
+            return (amount, 0);
+        }
+
+        let record = PaymentContract::get_or_default_merchant_fee_record(env, merchant.clone());
+        let risk_config: RiskFeeConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config(ConfigKey::RiskFeeConfig))
+            .unwrap_or(RiskFeeConfig {
+                base_fee_bps: 100,
+                large_amount_threshold: 1000000,
+                large_amount_surcharge_bps: 50,
+                new_customer_surcharge_bps: 100,
+                high_risk_currency_surcharge: 200,
+            });
+        let risk_surcharge_bps = PaymentContract::calculate_risk_score(
+            env.clone(),
+            customer.clone(),
+            merchant.clone(),
+            amount,
+            currency,
+        );
+        let effective_bps = (config.fee_bps as u64 + risk_surcharge_bps as u64)
+            .min(1000u64) as u32;
         let fee = PaymentContract::compute_fee_amount(
             amount,
-            config.fee_bps,
+            effective_bps,
             &record.fee_tier,
             config.min_fee,
             config.max_fee,
@@ -7606,7 +7629,7 @@ impl PaymentContract {
             return (amount, 0);
         }
 
-        let net_amount = amount - fee;
+        let net_amount = amount.saturating_sub(fee);
 
         // Transfer fee from customer to contract
         let token_client = token::Client::new(env, token);
@@ -7623,6 +7646,16 @@ impl PaymentContract {
             &DataKey::Payment(PaymentKey::AccumulatedFees),
             &(accumulated + fee),
         );
+
+        if risk_surcharge_bps > 0 {
+            (RiskFeeApplied {
+                payment_id,
+                base_fee_bps: config.fee_bps,
+                risk_surcharge_bps,
+                total_fee_bps: effective_bps,
+            })
+            .publish(env);
+        }
 
         (FeeCollected {
             payment_id,
@@ -8572,6 +8605,7 @@ impl PaymentContract {
                 entry.merchant.clone(),
                 &entry.token,
                 &entry.customer,
+                entry.currency.clone(),
             );
 
             // Transfer from customer to contract
@@ -10632,7 +10666,7 @@ impl PaymentContract {
         amount: i128,
         currency: Currency,
     ) -> u32 {
-        let config: RiskFeeConfig = env
+        let risk_config: RiskFeeConfig = env
             .storage()
             .instance()
             .get(&DataKey::Config(ConfigKey::RiskFeeConfig))
@@ -10643,15 +10677,20 @@ impl PaymentContract {
                 new_customer_surcharge_bps: 100,
                 high_risk_currency_surcharge: 200,
             });
+        let fee_config: Option<FeeConfig> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config(ConfigKey::FeeConfig));
+        let base_fee_bps = fee_config.map_or(risk_config.base_fee_bps, |cfg| cfg.fee_bps);
 
         let risk_surcharge = Self::calculate_risk_score(env, customer, merchant, amount, currency);
-        let total_fee = config.base_fee_bps + risk_surcharge;
+        let total_fee = base_fee_bps as u64 + risk_surcharge as u64;
 
         // Fee cap at 1000 bps (10%)
         if total_fee > 1000 {
             1000
         } else {
-            total_fee
+            total_fee as u32
         }
     }
 
