@@ -247,6 +247,8 @@ pub enum FeatureError {
     InvalidForwardBps = 537,
     SenderIsRecipient = 538,
     BelowMinSplitAmount = 539,
+    // Issue #385: claimed settlement amounts must sum exactly to the channel deposit.
+    BalanceSumMismatch = 541,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -10867,7 +10869,7 @@ impl PaymentContract {
             return Err(Error::Feature(FeatureError::InvalidNonce));
         }
 
-        if merchant_amount > channel.deposited {
+        if merchant_amount < 0 || merchant_amount > channel.deposited {
             return Err(Error::Basic(BasicError::InvalidAmount));
         }
 
@@ -10881,6 +10883,17 @@ impl PaymentContract {
             .ed25519_verify(&channel.customer_pk, &msg, &signature);
 
         let customer_refund = channel.deposited - merchant_amount;
+
+        // Issue #385: assert the claimed settlement conserves the original deposit —
+        // the merchant's claim plus the customer's derived refund must sum exactly
+        // to what was deposited, never more.
+        if merchant_amount
+            .checked_add(customer_refund)
+            .ok_or(Error::Feature(FeatureError::BalanceSumMismatch))?
+            != channel.deposited
+        {
+            return Err(Error::Feature(FeatureError::BalanceSumMismatch));
+        }
         let token_client = token::Client::new(&env, &channel.token);
         let contract_address = env.current_contract_address();
 
