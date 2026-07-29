@@ -680,6 +680,15 @@ pub struct AppealResolved {
 
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AppealExpired {
+    pub appeal_id: u64,
+    pub escrow_id: u64,
+    pub upheld_in_favor_of: Address,
+    pub expired_at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TemplateCreated {
     pub template_id: u64,
     pub owner: Address,
@@ -5194,6 +5203,107 @@ impl EscrowContract {
             escrow_id,
             in_favor_of: in_favour_of,
             resolved_at: now,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Expires an unresolved dispute appeal once its `appeal_deadline` has passed.
+    ///
+    /// Permissionless counterpart to [`resolve_appeal`], mirroring
+    /// [`trigger_timeout_resolution`] for the initial dispute stage. If an admin never
+    /// calls `resolve_appeal`, anyone may call this once `now > appeal_deadline` to force
+    /// finality so the escrow is not stuck in the `Appeal` round indefinitely.
+    ///
+    /// The pre-appeal outcome stands: the escrow funds were already distributed to the
+    /// winner during the initial dispute resolution, so no transfer is performed here.
+    /// The appeal is rejected and the dispute round advanced to `Final`.
+    ///
+    /// # Arguments
+    /// * `env` - Soroban environment.
+    /// * `appeal_id` - Identifier of the appeal to expire.
+    ///
+    /// # Returns
+    /// Results in `Ok(())` on success or `Err(Error)` on failure.
+    ///
+    /// # Errors
+    /// * `NotFound` - the appeal or its escrow does not exist.
+    /// * `AlreadyProcessed` - the appeal has already been resolved or expired.
+    /// * `TimeoutNotReached` - the appeal deadline has not yet passed.
+    pub fn expire_appeal(env: Env, appeal_id: u64) -> Result<(), Error> {
+        let mut appeal = env
+            .storage()
+            .instance()
+            .get::<DataKey, DisputeAppeal>(&DataKey::Dispute(DisputeKey::Appeal(appeal_id)))
+            .ok_or(Error::Escrow(EscrowError::NotFound))?;
+
+        if appeal.resolved {
+            return Err(Error::Escrow(EscrowError::AlreadyProcessed));
+        }
+
+        let now = env.ledger().timestamp();
+        if now <= appeal.appeal_deadline {
+            return Err(Error::Escrow(EscrowError::TimeoutNotReached));
+        }
+
+        let escrow_id = appeal.escrow_id;
+
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::Escrow(EscrowKey::Data(escrow_id)))
+        {
+            return Err(Error::Escrow(EscrowError::NotFound));
+        }
+
+        // Mark the appeal resolved and advance the round to Final so the dispute state
+        // machine can no longer be blocked in the Appeal round.
+        appeal.resolved = true;
+        env.storage()
+            .instance()
+            .set(&DataKey::Dispute(DisputeKey::Appeal(appeal_id)), &appeal);
+
+        env.storage().instance().set(
+            &DataKey::Dispute(DisputeKey::Round(escrow_id)),
+            &DisputeRound::Final,
+        );
+
+        // Reflect the timeout in the persisted audit record.
+        if let Some(mut record) = env
+            .storage()
+            .instance()
+            .get::<DataKey, AppealRecord>(&DataKey::Dispute(DisputeKey::AppealRecord(
+                escrow_id, appeal_id,
+            )))
+        {
+            record.status = AppealStatus::Rejected;
+            env.storage().instance().set(
+                &DataKey::Dispute(DisputeKey::AppealRecord(escrow_id, appeal_id)),
+                &record,
+            );
+        }
+
+        // The pre-appeal outcome stands. Funds were already transferred to the winner
+        // during the initial dispute resolution, so we only record which party the
+        // upheld outcome favored (Released => merchant, otherwise => customer).
+        let mut escrow = EscrowContract::get_escrow(&env, escrow_id);
+        let upheld_in_favor_of = if escrow.status == EscrowStatus::Released {
+            escrow.merchant.clone()
+        } else {
+            escrow.customer.clone()
+        };
+
+        escrow.last_activity_at = now;
+        env.storage()
+            .instance()
+            .set(&DataKey::Escrow(EscrowKey::Data(escrow_id)), &escrow);
+
+        AppealExpired {
+            appeal_id,
+            escrow_id,
+            upheld_in_favor_of,
+            expired_at: now,
         }
         .publish(&env);
 
@@ -11276,6 +11386,9 @@ mod hold_period_test;
 
 #[cfg(test)]
 mod succession_test;
+
+#[cfg(test)]
+mod appeal_expiry_test;
 
 #[cfg(test)]
 mod escalation_timeout_test;
