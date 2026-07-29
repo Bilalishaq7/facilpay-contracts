@@ -45,6 +45,7 @@ pub enum ConfigKey {
     MinSplitAmount,
     SchemaVersion,
     AllowedTokens,
+    MaxForwardDepth,
 }
 
 #[derive(Clone)]
@@ -3961,10 +3962,17 @@ impl PaymentContract {
             return Err(Error::Feature(FeatureError::InvalidForwardBps));
         }
 
-        // Detect cycles (including self-referential) by walking the forward chain up to 10 hops.
+        // Get configured max depth (default 5)
+        let max_depth: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config(ConfigKey::MaxForwardDepth))
+            .unwrap_or(5);
+
+        // Detect cycles and enforce depth limit by walking the forward chain
         {
             let mut current = forward_to.clone();
-            for _ in 0..10u32 {
+            for _depth in 0..max_depth {
                 if current == merchant {
                     return Err(Error::Feature(FeatureError::ForwardLoop));
                 }
@@ -3972,11 +3980,21 @@ impl PaymentContract {
                     .storage()
                     .instance()
                     .get::<DataKey, PaymentForwardConfig>(&DataKey::Feature(
-                        FeatureKey::PaymentForwardConfig(current),
+                        FeatureKey::PaymentForwardConfig(current.clone()),
                     )) {
                     Some(next) => current = next.forward_to,
                     None => break,
                 }
+            }
+            // If we exhausted max_depth iterations, the chain is too long
+            if env
+                .storage()
+                .instance()
+                .has(&DataKey::Feature(FeatureKey::PaymentForwardConfig(
+                    current.clone(),
+                )))
+            {
+                return Err(Error::Feature(FeatureError::ForwardLoop));
             }
         }
 
@@ -7369,6 +7387,39 @@ impl PaymentContract {
             .instance()
             .get(&DataKey::Config(ConfigKey::FeeConfig))
             .ok_or(Error::Feature(FeatureError::FeeConfigNotFound))
+    }
+
+    /// Admin sets the maximum forward chain depth.
+    /// 
+    /// # Arguments
+    /// * `admin` - The admin address (must be in multisig config)
+    /// * `max_depth` - Maximum allowed hops in a forward chain (default: 5)
+    /// 
+    /// # Returns
+    /// `Ok(())` on success, or an error if unauthorized or contract is paused.
+    pub fn set_max_forward_depth(env: Env, admin: Address, max_depth: u32) -> Result<(), Error> {
+        Self::require_not_paused(&env, "set_max_forward_depth")?;
+        admin.require_auth();
+        let config: MultiSigConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config(ConfigKey::MultiSigConfig))
+            .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
+        if !config.admins.contains(&admin) {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::Config(ConfigKey::MaxForwardDepth), &max_depth);
+        Ok(())
+    }
+
+    /// Returns the maximum forward chain depth.
+    pub fn get_max_forward_depth(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::Config(ConfigKey::MaxForwardDepth))
+            .unwrap_or(5)
     }
 
     /// Calculates the fee for a given amount and merchant (accounting for tier discount and waivers).
