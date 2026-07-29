@@ -249,6 +249,19 @@ The refund contract defines a set of numeric error codes in [src/lib.rs](src/lib
 - `set_strict_tier_policy()` — Merchant enables/disables strict tier policy enforcement.
 - `get_strict_tier_policy()` — Checks if strict tier policy is enabled.
 
+## 🏷️ Refund Reason Codes
+
+`request_refund()` requires a canonical `reason_code: RefundReasonCode` parameter to support structured analytics (`get_reason_code_analytics()`) and reason-based filtering (`get_refunds_by_reason_code()`).
+
+| Reason Code Variant | Description | Intended Scenario |
+| :--- | :--- | :--- |
+| `ProductDefect` | Product or service delivered was defective, damaged, faulty, or not as described. | Physical item damaged in transit, malfunctioning product, or incorrect item version delivered. |
+| `NonDelivery` | Goods or services were not fulfilled or delivered within the promised timeframe. | Package lost in transit, unfulfilled service contract, or digital goods delivery failure. |
+| `DuplicateCharge` | Customer was billed multiple times for a single order or transaction. | Payment gateway retry error, accidental double-submit, or recurring billing glitch. |
+| `Unauthorized` | Transaction was completed without the account owner's authorization or consent. | Account takeover, stolen payment credentials, or fraudulent transaction activity. |
+| `CustomerRequest` | Customer requested a standard return, cancellation, or refund under merchant terms. | Buyer's remorse, change of mind, or return within merchant policy windows. |
+| `Other` | Fallback category for custom, uncategorized, or legacy refund reason codes. | Upstream custom merchant flows, unclassified reasons, or historical data migrations. |
+
 ## ⚖️ Arbitration Workflow
 
 A refund dispute reaches arbitration after a refund has been rejected and the affected party escalates it for review. The contract creates an arbitration case only when there is a sufficient panel of registered arbitrators, and the escalator must provide an arbitration fee in the configured token. If staking is enabled, the escalator also deposits a stake, which acts as a bonding mechanism for the dispute.
