@@ -11,6 +11,61 @@ Multi-party escrows can require a minimum approval weight before funds are relea
 - The minimum safe threshold is `1` bps, but in practice you should use a higher value for any escrow that holds meaningful funds. Setting the threshold too low can let a small group of signers release funds with weak consensus, which increases the risk of misuse or compromise.
 - Recommended defaults are `10000` for high-value or sensitive escrows, and `5000` or higher for majority-based approval policies.
 
+## Dispute lifecycle
+
+An escrow moves through dispute states via `dispute_escrow`, `escalate_dispute`, `file_dispute_appeal`, `resolve_appeal`, `resolve_dispute`/`auto_resolve_dispute`, and the timeout paths `trigger_timeout_resolution` / `process_escalation_timeouts`.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Locked: create_escrow_with_multisig / create_conditional_escrow
+    Locked --> Released: release_escrow
+    Locked --> Disputed: dispute_escrow (customer or merchant)
+    Locked --> Cancelled: cancel_escrow
+
+    Disputed --> Resolved: resolve_dispute / auto_resolve_dispute (favors customer)
+    Disputed --> Released: auto_resolve_dispute (favors merchant)
+    Disputed --> Escalated: escalate_dispute (customer or merchant)
+
+    Escalated --> Resolved: trigger_timeout_resolution (favor: Customer)
+    Escalated --> Released: trigger_timeout_resolution (favor: Merchant)
+    Escalated --> Escalated: process_escalation_timeouts (batch sweep, no state change until deadline hit)
+
+    Resolved --> Appealed: file_dispute_appeal (within 72h appeal window, Initial round only)
+    Released --> Appealed: file_dispute_appeal (within 72h appeal window, Initial round only)
+    Appealed --> Resolved: resolve_appeal
+    Appealed --> Released: resolve_appeal
+
+    Released --> [*]
+    Resolved --> [*]
+    Cancelled --> [*]
+```
+
+Notes:
+- Only the escrow's `customer` or `merchant` can open a dispute, escalate it, or file an appeal.
+- Each escrow allows at most one appeal round (`DisputeRound::Initial` → `Appeal` → `Final`); a third round is rejected.
+- The appeal window is fixed at 72 hours (259200 seconds) from `dispute_started_at`; filing after that window returns `InvalidStatus`.
+- Escalation timeouts are configured per-contract via `set_escalation_config` (timeout duration + which party auto-resolution favors) and enforced by `trigger_timeout_resolution` (single escrow) or `process_escalation_timeouts` (batch sweep of the escalation queue).
+
+## Observer role
+
+Observers get time-limited, read-only visibility into a single escrow — useful for auditors, support staff, or dispute mediators who need to inspect an escrow without being a party to it.
+
+- **Granting access** — `add_observer(granter, escrow_id, observer, duration_seconds)` grants `observer` read access to `escrow_id` until `now + duration_seconds`. `granter` must be the escrow's `customer`, its `merchant`, or an address in the admin multisig (`AdminMultiSig`).
+- **Revoking access** — `remove_observer(granter, escrow_id, observer)` removes an observer entry early. Same caller restriction as granting.
+- **Checking access** — `verify_observer_access(escrow_id, observer)` returns `true` only if the address was granted observer status and `expires_at` is still in the future; expired grants are not deleted automatically but read as inactive.
+- **Listing** — `get_observers(escrow_id)` returns all observer entries for an escrow, including expired ones (callers should check `expires_at` themselves).
+
+Access split:
+
+| Function | Observer access |
+|----------|------------------|
+| `get_escrow_details(caller, escrow_id)` | Readable — succeeds for the customer, merchant, or any active (non-expired) observer. |
+| `get_observers`, `verify_observer_access`, `get_dispute_round`, `get_appeal`, `is_escrow_disputed` | Public/unauthenticated reads, not gated by observer status. |
+| `add_observer`, `remove_observer` | Restricted — customer, merchant, or admin only. Observers cannot grant or revoke observer access, including their own. |
+| `dispute_escrow`, `escalate_dispute`, `file_dispute_appeal`, `release_escrow`, `resolve_dispute`, and all fund-moving or state-changing calls | Restricted — observers have no write access; these remain limited to the customer, merchant, arbitrators, or admins as applicable. |
+
+An observer is purely a read-only role: it never satisfies `require_auth` checks for customer/merchant/admin-gated functions, so granting observer access cannot be used to bypass dispute or fund-release authorization.
+
 ## Events
 
 All events are emitted via `#[contractevent]` structs published through the Soroban event system. Each event's **topic** is a `Symbol` matching the struct name. Off-chain consumers (Horizon, indexers) can subscribe to these topics.
