@@ -6692,8 +6692,23 @@ impl RefundContract {
 
     // Helper functions for fraud detection
     fn get_customer_payment_count(env: &Env, address: &Address) -> u64 {
-        // Without a payment contract configured, we have no payment data
-        0
+        let payment_contract: Address = match env
+            .storage()
+            .instance()
+            .get(&DataKey::PaymentContractAddress)
+        {
+            Some(addr) => addr,
+            None => return 0,
+        };
+
+        let func = Symbol::new(env, "get_payment_count_by_customer");
+        let args = (address.clone(),).into_val(env);
+
+        match env.try_invoke_contract::<u64, soroban_sdk::InvokeError>(&payment_contract, &func, args)
+        {
+            Ok(Ok(count)) => count,
+            _ => 0,
+        }
     }
 
     fn get_customer_refund_count(env: &Env, address: &Address) -> u64 {
