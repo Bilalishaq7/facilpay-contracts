@@ -160,6 +160,13 @@ pub enum SystemKey {
     CustomerRefundCooldown(Address),
     RefundCooldownConfig,
     SchemaVersion,
+    // Issue #382: cached reason-code analytics for a given [window_start, window_end]
+    // ledger-timestamp range, so repeated queries over the same window don't
+    // re-scan the full refund history.
+    AnalyticsCache(u64, u64),
+    // Tracks the distinct (window_start, window_end) pairs cached above, so a newly
+    // processed refund can invalidate only the windows it actually falls within.
+    AnalyticsCacheWindows,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -4051,11 +4058,30 @@ impl RefundContract {
         results
     }
 
-    /// Get analytics showing the count of refunds for each reason code, sorted by frequency.
+    /// Get analytics showing the count of refunds for each reason code, sorted by frequency,
+    /// restricted to refunds created within `[window_start, window_end]` (inclusive).
+    ///
+    /// The result is deterministic for a given window and is cached under
+    /// `SystemKey::AnalyticsCache(window_start, window_end)`. The cache is invalidated
+    /// (recomputed) only when a refund whose `created_at` falls inside that window is
+    /// processed after the cache entry was written (see `process_refund_internal`).
     ///
     /// # Returns
     /// A vector of `(RefundReasonCode, count)` tuples sorted by descending count.
-    pub fn get_reason_code_analytics(env: Env) -> Vec<(RefundReasonCode, u64)> {
+    pub fn get_reason_code_analytics(
+        env: Env,
+        window_start: u64,
+        window_end: u64,
+    ) -> Vec<(RefundReasonCode, u64)> {
+        let cache_key = SystemKey::AnalyticsCache(window_start, window_end);
+        if let Some(cached) = env
+            .storage()
+            .instance()
+            .get::<_, Vec<(RefundReasonCode, u64)>>(&cache_key)
+        {
+            return cached;
+        }
+
         let mut product_defect: u64 = 0;
         let mut non_delivery: u64 = 0;
         let mut duplicate_charge: u64 = 0;
@@ -4076,13 +4102,15 @@ impl RefundContract {
                 .instance()
                 .get::<_, Refund>(&DataKey::Refund(id))
             {
-                match refund.reason_code {
-                    RefundReasonCode::ProductDefect => product_defect += 1,
-                    RefundReasonCode::NonDelivery => non_delivery += 1,
-                    RefundReasonCode::DuplicateCharge => duplicate_charge += 1,
-                    RefundReasonCode::Unauthorized => unauthorized += 1,
-                    RefundReasonCode::CustomerRequest => customer_request += 1,
-                    RefundReasonCode::Other => other += 1,
+                if refund.requested_at >= window_start && refund.requested_at <= window_end {
+                    match refund.reason_code {
+                        RefundReasonCode::ProductDefect => product_defect += 1,
+                        RefundReasonCode::NonDelivery => non_delivery += 1,
+                        RefundReasonCode::DuplicateCharge => duplicate_charge += 1,
+                        RefundReasonCode::Unauthorized => unauthorized += 1,
+                        RefundReasonCode::CustomerRequest => customer_request += 1,
+                        RefundReasonCode::Other => other += 1,
+                    }
                 }
             }
             id += 1;
@@ -4110,7 +4138,43 @@ impl RefundContract {
         for (code, count) in ordered {
             result.push_back((code, count));
         }
+
+        env.storage().instance().set(&cache_key, &result);
+
+        let mut windows: Vec<(u64, u64)> = env
+            .storage()
+            .instance()
+            .get(&SystemKey::AnalyticsCacheWindows)
+            .unwrap_or(Vec::new(&env));
+        if !windows.iter().any(|w| w == (window_start, window_end)) {
+            windows.push_back((window_start, window_end));
+            env.storage()
+                .instance()
+                .set(&SystemKey::AnalyticsCacheWindows, &windows);
+        }
+
         result
+    }
+
+    /// Invalidate any cached analytics window that contains `requested_at`.
+    ///
+    /// Only called when a refund is processed, per issue #382: caches are keyed by
+    /// window and there is no bounded index of "cache keys ever written," so we
+    /// track the small set of distinct windows queried so far and drop the ones
+    /// whose range covers the newly processed refund's `requested_at`.
+    fn invalidate_analytics_cache_for(env: &Env, requested_at: u64) {
+        let windows: Vec<(u64, u64)> = env
+            .storage()
+            .instance()
+            .get(&SystemKey::AnalyticsCacheWindows)
+            .unwrap_or(Vec::new(env));
+        for (window_start, window_end) in windows.iter() {
+            if requested_at >= window_start && requested_at <= window_end {
+                env.storage()
+                    .instance()
+                    .remove(&SystemKey::AnalyticsCache(window_start, window_end));
+            }
+        }
     }
 
     /// Get the total number of refunds in a given status.
@@ -5585,6 +5649,9 @@ impl RefundContract {
             .instance()
             .set(&DataKey::Refund(refund_id), &refund);
         Self::add_to_status_index(env, RefundStatus::Processed, refund_id);
+        // Issue #382: this refund's requested_at may fall within a previously
+        // cached analytics window, so drop that cache entry.
+        Self::invalidate_analytics_cache_for(env, refund.requested_at);
 
         (RefundProcessed {
             refund_id,

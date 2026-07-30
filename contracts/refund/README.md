@@ -140,7 +140,7 @@ The `request_refund()` function requires a type-safe `RefundReasonCode` enum var
 - `get_merchant_pending_refunds()` — All pending refunds for a merchant.
 - `get_merchant_refund_summary()` — Aggregate refund stats for a merchant.
 - `get_refunds_by_reason_code()` — Paginated refunds filtered by canonical reason code.
-- `get_reason_code_analytics()` — Counts refunds by reason code, sorted by frequency.
+- `get_reason_code_analytics(window_start, window_end)` — Counts refunds by reason code within the given ledger-timestamp window, sorted by frequency. Cached per window and invalidated only when a refund inside that window is processed.
 - `get_total_refunded_amount()` — Cumulative refunded amount for a given payment.
 - `can_refund_payment()` — Checks if a refund would exceed the original payment amount.
 

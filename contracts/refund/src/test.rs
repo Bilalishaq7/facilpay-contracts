@@ -1337,7 +1337,7 @@ fn test_reason_code_analytics_sorted_by_frequency() {
         &0_u64,
     );
 
-    let analytics = client.get_reason_code_analytics();
+    let analytics = client.get_reason_code_analytics(&0u64, &u64::MAX);
     assert_eq!(analytics.len(), 6);
 
     assert_eq!(
@@ -1361,6 +1361,74 @@ fn test_reason_code_analytics_sorted_by_frequency() {
         (RefundReasonCode::Unauthorized, 0u64),
     );
     assert_eq!(analytics.get(5).unwrap(), (RefundReasonCode::Other, 0u64));
+}
+
+#[test]
+fn test_reason_code_analytics_cache_invalidated_on_process_within_window() {
+    // Issue #382: a cached window's analytics must reflect refunds processed
+    // inside that window, but a cached window can otherwise be served without
+    // rescanning the whole refund history.
+    let env = Env::default();
+    let contract_id = env.register(RefundContract, ());
+    let client = RefundContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let merchant = Address::generate(&env);
+    let customer = Address::generate(&env);
+    let token = Address::generate(&env);
+    let reason = String::from_str(&env, "cache-test");
+
+    env.mock_all_auths();
+    client.set_fraud_config(
+        &admin,
+        &FraudConfig {
+            max_refund_rate_bps: 10000,
+            min_transactions_for_check: 100,
+            enabled: false,
+        },
+    );
+
+    let refund_id = client.request_refund(
+        &merchant,
+        &1u64,
+        &customer,
+        &100i128,
+        &100i128,
+        &token,
+        &reason,
+        &RefundReasonCode::ProductDefect,
+        &0_u64,
+    );
+
+    // Populate the cache for the full window before this refund is processed.
+    let analytics = client.get_reason_code_analytics(&0u64, &u64::MAX);
+    assert_eq!(analytics.get(0).unwrap(), (RefundReasonCode::ProductDefect, 1u64));
+
+    client.approve_refund(&admin, &refund_id);
+    client.process_refund(&admin, &refund_id);
+
+    let refund_id2 = client.request_refund(
+        &merchant,
+        &2u64,
+        &customer,
+        &100i128,
+        &100i128,
+        &token,
+        &reason,
+        &RefundReasonCode::ProductDefect,
+        &0_u64,
+    );
+    client.approve_refund(&admin, &refund_id2);
+    client.process_refund(&admin, &refund_id2);
+
+    // The cache entry covering this refund's requested_at must have been
+    // invalidated by processing, so the recount reflects both refunds.
+    let analytics_after = client.get_reason_code_analytics(&0u64, &u64::MAX);
+    assert_eq!(
+        analytics_after.get(0).unwrap(),
+        (RefundReasonCode::ProductDefect, 2u64),
+    );
 }
 
 #[test]
