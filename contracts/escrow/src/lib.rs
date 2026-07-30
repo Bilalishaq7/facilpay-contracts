@@ -2691,6 +2691,10 @@ impl EscrowContract {
             }
         }
 
+        // Transfer funds from customer to contract
+        let token_client = token::Client::new(&env, &token);
+        token_client.transfer(&customer, &env.current_contract_address(), &amount);
+
         let counter: u64 = env
             .storage()
             .instance()
