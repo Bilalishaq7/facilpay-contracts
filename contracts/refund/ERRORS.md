@@ -35,6 +35,7 @@ This document lists the numeric error codes defined in the refund contract, thei
 | 29 | `CircuitBreakerTripped` | The refund circuit breaker is currently open because the configured threshold was exceeded. |
 | 30 | `InvalidFeeConfig` | The refund fee configuration is malformed or inconsistent. |
 | 31 | `InsufficientTreasuryFees` | There are not enough accumulated treasury fees to satisfy the requested withdrawal. |
+| 32 | `AutoApproveThresholdExceedsCeiling` | The merchant attempted to set an auto-approval threshold above the platform ceiling. |
 
 ## Extension errors (`ExtError`)
 
