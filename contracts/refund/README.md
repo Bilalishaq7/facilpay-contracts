@@ -20,6 +20,19 @@ cargo test -p refund
 
 The refund contract defines a set of numeric error codes in [src/lib.rs](src/lib.rs). For a complete reference of every error variant, see [ERRORS.md](ERRORS.md).
 
+## 🏷️ Refund Reason Codes
+
+The `request_refund()` function requires a type-safe `RefundReasonCode` enum variant to categorize refund requests for structured querying and analytics (`get_reason_code_analytics()`).
+
+| Variant           | Description                                                                                          | Intended Scenario                                                                         |
+| ----------------- | ---------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
+| `ProductDefect`   | Item or service was defective, damaged, non-functional, or significantly different from description. | Received a broken item, malfunctioning software, or flawed goods.                         |
+| `NonDelivery`     | Goods or services were not received within the expected fulfillment window or were lost in transit.  | Package lost in shipping, or service provider failed to show up.                          |
+| `DuplicateCharge` | Customer was billed multiple times by accident for a single order or transaction.                    | System or network error causing duplicate payment execution.                              |
+| `Unauthorized`    | Transaction was initiated without the account owner's knowledge or consent (fraudulent activity).    | Compromised account, stolen credentials, or unapproved charge.                            |
+| `CustomerRequest` | Buyer requested cancellation, return, or exchange under standard buyer's remorse or return policy.   | Customer changed their mind, ordered wrong size, or no longer needed the item.            |
+| `Other`           | Fallback or unclassified refund reason that does not fit standard variants, or legacy backfills.     | Custom agreements, edge cases, or initial code migrations for unknown historical reasons. |
+
 ## 📂 Public Functions
 
 ### Initialization & Schema
@@ -127,7 +140,7 @@ The refund contract defines a set of numeric error codes in [src/lib.rs](src/lib
 - `get_merchant_pending_refunds()` — All pending refunds for a merchant.
 - `get_merchant_refund_summary()` — Aggregate refund stats for a merchant.
 - `get_refunds_by_reason_code()` — Paginated refunds filtered by canonical reason code.
-- `get_reason_code_analytics()` — Counts refunds by reason code, sorted by frequency.
+- `get_reason_code_analytics(window_start, window_end)` — Counts refunds by reason code within the given ledger-timestamp window, sorted by frequency. Cached per window and invalidated only when a refund inside that window is processed.
 - `get_total_refunded_amount()` — Cumulative refunded amount for a given payment.
 - `can_refund_payment()` — Checks if a refund would exceed the original payment amount.
 
@@ -248,6 +261,83 @@ The refund contract defines a set of numeric error codes in [src/lib.rs](src/lib
 - `get_customer_tier_policy()` — Gets the refund cap for a specific customer tier.
 - `set_strict_tier_policy()` — Merchant enables/disables strict tier policy enforcement.
 - `get_strict_tier_policy()` — Checks if strict tier policy is enabled.
+
+---
+
+## 📡 Events
+
+The contract emits Soroban events for all state-changing operations. Off-chain integrators (Horizon subscribers, indexers) can subscribe to these events to monitor refund lifecycle, arbitration, and policy changes.
+
+### Core Refund Lifecycle Events
+
+| Event             | Topic Name        | Payload Fields                                                             | Fires When                                                           |
+| ----------------- | ----------------- | -------------------------------------------------------------------------- | -------------------------------------------------------------------- |
+| `RefundRequested` | `RefundRequested` | `refund_id`, `payment_id`, `merchant`, `customer`, `amount`, `token`       | `request_refund()` creates refund in `Requested` status              |
+| `RefundApproved`  | `RefundApproved`  | `refund_id`, `payment_id`, `amount`, `approved_by`, `approved_at`          | `approve_refund()` moves refund to `Approved` status                 |
+| `RefundRejected`  | `RefundRejected`  | `refund_id`, `rejected_by`, `rejected_at`, `rejection_reason`              | `reject_refund()` moves refund to `PendingAppeal` status             |
+| `RefundProcessed` | `RefundProcessed` | `refund_id`, `processed_by`, `customer`, `amount`, `token`, `processed_at` | `process_refund()` executes approved refund and moves to `Processed` |
+
+### Auto-Refund Trigger Events
+
+| Event                 | Topic Name            | Payload Fields                       | Fires When                                                       |
+| --------------------- | --------------------- | ------------------------------------ | ---------------------------------------------------------------- |
+| `TriggerRegistered`   | `TriggerRegistered`   | `trigger_id`, `payment_id`           | `register_auto_refund_trigger()` creates trigger record          |
+| `AutoRefundTriggered` | `AutoRefundTriggered` | `trigger_id`, `payment_id`, `amount` | `evaluate_auto_refund()` executes auto-refund when condition met |
+
+### Appeal Events
+
+| Event            | Topic Name       | Payload Fields                        | Fires When                                                  |
+| ---------------- | ---------------- | ------------------------------------- | ----------------------------------------------------------- |
+| `AppealFiled`    | `AppealFiled`    | `appeal_id`, `refund_id`, `appellant` | `file_appeal()` customer files appeal against rejection     |
+| `AppealResolved` | `AppealResolved` | `appeal_id`, `upheld`, `resolved_at`  | `resolve_appeal()` admin resolves appeal (upheld or denied) |
+
+### Arbitration Case Events
+
+| Event                          | Topic Name                     | Payload Fields                               | Fires When                                                                        |
+| ------------------------------ | ------------------------------ | -------------------------------------------- | --------------------------------------------------------------------------------- |
+| `RefundEscalatedToArbitration` | `RefundEscalatedToArbitration` | `refund_id`, `case_id`, `fee_pool`           | `escalate_to_arbitration()` creates arbitration case with initial fee pool        |
+| `ArbitrationVoteCast`          | `ArbitrationVoteCast`          | `case_id`, `arbitrator`, `vote_for_refund`   | `cast_arbitration_vote()` arbitrator votes on case                                |
+| `ArbitrationCaseDecided`       | `ArbitrationCaseDecided`       | `case_id`, `approved`                        | `close_arbitration_case()` case closes after quorum reached with majority outcome |
+| `ArbitrationTimedOut`          | `ArbitrationTimedOut`          | `case_id`, `default_outcome`, `triggered_at` | `trigger_arbitration_timeout()` case timeout expires and default outcome applied  |
+
+### Arbitration Fee & Stake Events
+
+| Event                        | Topic Name                   | Payload Fields                                 | Fires When                                                                 |
+| ---------------------------- | ---------------------------- | ---------------------------------------------- | -------------------------------------------------------------------------- |
+| `ArbitrationFeesDistributed` | `ArbitrationFeesDistributed` | `case_id`, `per_arbitrator`, `treasury_amount` | Case closes and fee pool distributed to arbitrators and treasury           |
+| `StakeDeposited`             | `StakeDeposited`             | `case_id`, `staker`, `amount`                  | `escalate_to_arbitration()` with staking enabled; escalator deposits stake |
+| `StakeReturned`              | `StakeReturned`              | `case_id`, `winner`, `amount`                  | Case closes with stake returned to winning party                           |
+| `StakeForfeited`             | `StakeForfeited`             | `case_id`, `loser`, `amount`                   | Case closes with stake forfeited to treasury from losing party             |
+
+### Arbitrator Events
+
+| Event                    | Topic Name               | Payload Fields                         | Fires When                                                                     |
+| ------------------------ | ------------------------ | -------------------------------------- | ------------------------------------------------------------------------------ |
+| `ArbitratorScoreUpdated` | `ArbitratorScoreUpdated` | `arbitrator`, `old_score`, `new_score` | Vote outcome recorded; arbitrator reputation score adjusted                    |
+| `ArbitratorDeregistered` | `ArbitratorDeregistered` | `arbitrator`, `reason`                 | `deregister_low_performers()` removes arbitrator below minimum score threshold |
+
+### Policy Events
+
+| Event                                       | Topic Name | Payload Fields | Fires When                                                           |
+| ------------------------------------------- | ---------- | -------------- | -------------------------------------------------------------------- |
+| (Policy changes tracked via function calls) | —          | —              | Use `get_refund_policy_history()` to audit policy versions over time |
+
+### Contract Control Events
+
+| Event                   | Topic Name              | Payload Fields                         | Fires When                                             |
+| ----------------------- | ----------------------- | -------------------------------------- | ------------------------------------------------------ |
+| `ContractPausedEvent`   | `ContractPausedEvent`   | `paused_by`, `reason`, `paused_at`     | `pause_contract()` halts all state-changing operations |
+| `ContractUnpausedEvent` | `ContractUnpausedEvent` | `unpaused_by`, `unpaused_at`           | `unpause_contract()` resumes operations                |
+| `FunctionPausedEvent`   | `FunctionPausedEvent`   | `function_name`, `paused_by`, `reason` | `pause_function()` pauses specific function            |
+| `FunctionUnpausedEvent` | `FunctionUnpausedEvent` | `function_name`, `unpaused_by`         | `unpause_function()` resumes function                  |
+
+### Circuit Breaker Events
+
+| Event                        | Topic Name                   | Payload Fields                           | Fires When                                                                      |
+| ---------------------------- | ---------------------------- | ---------------------------------------- | ------------------------------------------------------------------------------- |
+| `CircuitBreakerTrippedEvent` | `CircuitBreakerTrippedEvent` | `triggered_by`, `reason`, `triggered_at` | Circuit breaker activates due to refund volume threshold or error rate exceeded |
+
+---
 
 ## ⚖️ Arbitration Workflow
 

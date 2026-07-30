@@ -85,6 +85,8 @@ pub enum DataKey {
     CustomerTierPolicy(Address, u32),
     StrictTierPolicy(Address),
     AppealWindowSeconds,
+    // Issue #389: two-step admin rotation
+    PendingAdmin,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -158,6 +160,13 @@ pub enum SystemKey {
     CustomerRefundCooldown(Address),
     RefundCooldownConfig,
     SchemaVersion,
+    // Issue #382: cached reason-code analytics for a given [window_start, window_end]
+    // ledger-timestamp range, so repeated queries over the same window don't
+    // re-scan the full refund history.
+    AnalyticsCache(u64, u64),
+    // Tracks the distinct (window_start, window_end) pairs cached above, so a newly
+    // processed refund can invalidate only the windows it actually falls within.
+    AnalyticsCacheWindows,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -285,6 +294,9 @@ pub enum ExtError {
     // Issue #370: Customer tier policy errors
     TierPolicyNotFound = 57,
     SchemaAlreadyAtTarget = 58,
+    // Issue #389: two-step admin rotation errors
+    NoPendingAdmin = 59,
+    NotPendingAdmin = 60,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1308,6 +1320,22 @@ pub struct RateLimitUpdated {
     pub effective_at: u64,
 }
 
+/// Event emitted when the current admin proposes a new admin.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminRotationProposed {
+    pub current_admin: Address,
+    pub pending_admin: Address,
+}
+
+/// Event emitted when a proposed admin accepts the role, completing rotation.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminRotationAccepted {
+    pub previous_admin: Address,
+    pub new_admin: Address,
+}
+
 #[contract]
 pub struct RefundContract;
 
@@ -1399,6 +1427,86 @@ impl RefundContract {
             .instance()
             .set(&SystemKey::SchemaVersion, &target_version);
         Ok(())
+    }
+
+    /// Propose a new admin, starting a two-step rotation (Issue #389).
+    ///
+    /// The current admin designates `new_admin` as pending. The rotation only
+    /// completes once `new_admin` calls [`Self::accept_admin`], so a typo'd or
+    /// unreachable address can never brick admin control of the contract.
+    ///
+    /// # Arguments
+    /// * `admin` - The current admin (must be authorized and match stored admin).
+    /// * `new_admin` - The address to propose as the next admin.
+    ///
+    /// # Errors
+    /// Returns `Unauthorized` if the caller is not the current admin.
+    pub fn propose_admin(env: Env, admin: Address, new_admin: Address) -> Result<(), Error> {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Core(CoreError::Unauthorized))?;
+        if admin != stored_admin {
+            return Err(Error::Core(CoreError::Unauthorized));
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingAdmin, &new_admin);
+
+        (AdminRotationProposed {
+            current_admin: admin,
+            pending_admin: new_admin,
+        })
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Accept a pending admin rotation, finalizing the transition (Issue #389).
+    ///
+    /// Must be called by the address previously proposed via
+    /// [`Self::propose_admin`]. Replaces `DataKey::Admin` with the caller and
+    /// clears the pending slot.
+    ///
+    /// # Errors
+    /// Returns `NoPendingAdmin` if no rotation has been proposed.
+    /// Returns `NotPendingAdmin` if the caller is not the proposed admin.
+    pub fn accept_admin(env: Env, new_admin: Address) -> Result<(), Error> {
+        new_admin.require_auth();
+
+        let pending: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .ok_or(Error::Ext(ExtError::NoPendingAdmin))?;
+        if pending != new_admin {
+            return Err(Error::Ext(ExtError::NotPendingAdmin));
+        }
+
+        let previous_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Core(CoreError::Unauthorized))?;
+
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+
+        (AdminRotationAccepted {
+            previous_admin,
+            new_admin,
+        })
+        .publish(&env);
+
+        Ok(())
+    }
+
+    /// Get the address currently proposed as the next admin, if any.
+    pub fn get_pending_admin(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::PendingAdmin)
     }
 
     /// Request a refund for a payment.
@@ -3950,11 +4058,30 @@ impl RefundContract {
         results
     }
 
-    /// Get analytics showing the count of refunds for each reason code, sorted by frequency.
+    /// Get analytics showing the count of refunds for each reason code, sorted by frequency,
+    /// restricted to refunds created within `[window_start, window_end]` (inclusive).
+    ///
+    /// The result is deterministic for a given window and is cached under
+    /// `SystemKey::AnalyticsCache(window_start, window_end)`. The cache is invalidated
+    /// (recomputed) only when a refund whose `created_at` falls inside that window is
+    /// processed after the cache entry was written (see `process_refund_internal`).
     ///
     /// # Returns
     /// A vector of `(RefundReasonCode, count)` tuples sorted by descending count.
-    pub fn get_reason_code_analytics(env: Env) -> Vec<(RefundReasonCode, u64)> {
+    pub fn get_reason_code_analytics(
+        env: Env,
+        window_start: u64,
+        window_end: u64,
+    ) -> Vec<(RefundReasonCode, u64)> {
+        let cache_key = SystemKey::AnalyticsCache(window_start, window_end);
+        if let Some(cached) = env
+            .storage()
+            .instance()
+            .get::<_, Vec<(RefundReasonCode, u64)>>(&cache_key)
+        {
+            return cached;
+        }
+
         let mut product_defect: u64 = 0;
         let mut non_delivery: u64 = 0;
         let mut duplicate_charge: u64 = 0;
@@ -3975,13 +4102,15 @@ impl RefundContract {
                 .instance()
                 .get::<_, Refund>(&DataKey::Refund(id))
             {
-                match refund.reason_code {
-                    RefundReasonCode::ProductDefect => product_defect += 1,
-                    RefundReasonCode::NonDelivery => non_delivery += 1,
-                    RefundReasonCode::DuplicateCharge => duplicate_charge += 1,
-                    RefundReasonCode::Unauthorized => unauthorized += 1,
-                    RefundReasonCode::CustomerRequest => customer_request += 1,
-                    RefundReasonCode::Other => other += 1,
+                if refund.requested_at >= window_start && refund.requested_at <= window_end {
+                    match refund.reason_code {
+                        RefundReasonCode::ProductDefect => product_defect += 1,
+                        RefundReasonCode::NonDelivery => non_delivery += 1,
+                        RefundReasonCode::DuplicateCharge => duplicate_charge += 1,
+                        RefundReasonCode::Unauthorized => unauthorized += 1,
+                        RefundReasonCode::CustomerRequest => customer_request += 1,
+                        RefundReasonCode::Other => other += 1,
+                    }
                 }
             }
             id += 1;
@@ -4009,7 +4138,43 @@ impl RefundContract {
         for (code, count) in ordered {
             result.push_back((code, count));
         }
+
+        env.storage().instance().set(&cache_key, &result);
+
+        let mut windows: Vec<(u64, u64)> = env
+            .storage()
+            .instance()
+            .get(&SystemKey::AnalyticsCacheWindows)
+            .unwrap_or(Vec::new(&env));
+        if !windows.iter().any(|w| w == (window_start, window_end)) {
+            windows.push_back((window_start, window_end));
+            env.storage()
+                .instance()
+                .set(&SystemKey::AnalyticsCacheWindows, &windows);
+        }
+
         result
+    }
+
+    /// Invalidate any cached analytics window that contains `requested_at`.
+    ///
+    /// Only called when a refund is processed, per issue #382: caches are keyed by
+    /// window and there is no bounded index of "cache keys ever written," so we
+    /// track the small set of distinct windows queried so far and drop the ones
+    /// whose range covers the newly processed refund's `requested_at`.
+    fn invalidate_analytics_cache_for(env: &Env, requested_at: u64) {
+        let windows: Vec<(u64, u64)> = env
+            .storage()
+            .instance()
+            .get(&SystemKey::AnalyticsCacheWindows)
+            .unwrap_or(Vec::new(env));
+        for (window_start, window_end) in windows.iter() {
+            if requested_at >= window_start && requested_at <= window_end {
+                env.storage()
+                    .instance()
+                    .remove(&SystemKey::AnalyticsCache(window_start, window_end));
+            }
+        }
     }
 
     /// Get the total number of refunds in a given status.
@@ -5484,6 +5649,9 @@ impl RefundContract {
             .instance()
             .set(&DataKey::Refund(refund_id), &refund);
         Self::add_to_status_index(env, RefundStatus::Processed, refund_id);
+        // Issue #382: this refund's requested_at may fall within a previously
+        // cached analytics window, so drop that cache entry.
+        Self::invalidate_analytics_cache_for(env, refund.requested_at);
 
         (RefundProcessed {
             refund_id,
@@ -7959,6 +8127,12 @@ impl RefundContract {
             return Err(Error::Ext(ExtError::VoucherExpired));
         }
 
+        token::Client::new(&env, &voucher.token).transfer(
+            &env.current_contract_address(),
+            &customer,
+            &voucher.amount,
+        );
+
         voucher.redeemed = true;
         env.storage()
             .instance()
@@ -8472,3 +8646,6 @@ mod schema_version_test;
 
 #[cfg(test)]
 mod test_merchant_override_and_error_codes;
+
+#[cfg(test)]
+mod test_admin_rotation;
