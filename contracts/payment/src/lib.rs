@@ -45,6 +45,7 @@ pub enum ConfigKey {
     MinSplitAmount,
     SchemaVersion,
     AllowedTokens,
+    MaxForwardDepth,
 }
 
 #[derive(Clone)]
@@ -64,6 +65,7 @@ pub enum PaymentKey {
     PendingSettlement(u64),
     AccumulatedFees,
     LargePaymentCounter,
+    Discount(u64),
 }
 
 pub const MAX_MEMO_VERSIONS: u32 = 10;
@@ -246,6 +248,8 @@ pub enum FeatureError {
     InvalidForwardBps = 537,
     SenderIsRecipient = 538,
     BelowMinSplitAmount = 539,
+    // Issue #385: claimed settlement amounts must sum exactly to the channel deposit.
+    BalanceSumMismatch = 541,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -912,6 +916,14 @@ pub struct ChannelOpened {
     pub customer: Address,
     pub merchant: Address,
     pub amount: i128,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChannelToppedUp {
+    pub channel_id: u64,
+    pub amount: i128,
+    pub new_deposited: i128,
 }
 
 #[contractevent]
@@ -3731,11 +3743,31 @@ impl PaymentContract {
             }
         }
 
+        // Subtract any loyalty-point discount redeemed against this payment (#490)
+        let discount: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Payment(PaymentKey::Discount(payment_id)))
+            .unwrap_or(0);
+        let charge_amount = if discount > 0 {
+            env.storage()
+                .instance()
+                .remove(&DataKey::Payment(PaymentKey::Discount(payment_id)));
+            let capped_discount = if discount > payment.amount {
+                payment.amount
+            } else {
+                discount
+            };
+            payment.amount - capped_discount
+        } else {
+            payment.amount
+        };
+
         // Deduct platform fee (if configured) and get net amount for merchant
         let (net_amount, fee_amount) = PaymentContract::deduct_fee(
             env,
             payment_id,
-            payment.amount,
+            charge_amount,
             payment.merchant.clone(),
             &payment.token,
             &payment.customer,
@@ -3961,10 +3993,17 @@ impl PaymentContract {
             return Err(Error::Feature(FeatureError::InvalidForwardBps));
         }
 
-        // Detect cycles (including self-referential) by walking the forward chain up to 10 hops.
+        // Get configured max depth (default 5)
+        let max_depth: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config(ConfigKey::MaxForwardDepth))
+            .unwrap_or(5);
+
+        // Detect cycles and enforce depth limit by walking the forward chain
         {
             let mut current = forward_to.clone();
-            for _ in 0..10u32 {
+            for _depth in 0..max_depth {
                 if current == merchant {
                     return Err(Error::Feature(FeatureError::ForwardLoop));
                 }
@@ -3972,11 +4011,21 @@ impl PaymentContract {
                     .storage()
                     .instance()
                     .get::<DataKey, PaymentForwardConfig>(&DataKey::Feature(
-                        FeatureKey::PaymentForwardConfig(current),
+                        FeatureKey::PaymentForwardConfig(current.clone()),
                     )) {
                     Some(next) => current = next.forward_to,
                     None => break,
                 }
+            }
+            // If we exhausted max_depth iterations, the chain is too long
+            if env
+                .storage()
+                .instance()
+                .has(&DataKey::Feature(FeatureKey::PaymentForwardConfig(
+                    current.clone(),
+                )))
+            {
+                return Err(Error::Feature(FeatureError::ForwardLoop));
             }
         }
 
@@ -4174,6 +4223,16 @@ impl PaymentContract {
         env.storage().instance().set(
             &DataKey::Feature(FeatureKey::CustomerLoyaltyBalance(customer.clone())),
             &balance,
+        );
+
+        let existing_discount: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Payment(PaymentKey::Discount(payment_id)))
+            .unwrap_or(0);
+        env.storage().instance().set(
+            &DataKey::Payment(PaymentKey::Discount(payment_id)),
+            &(existing_discount + discount),
         );
 
         Ok(discount)
@@ -7369,6 +7428,39 @@ impl PaymentContract {
             .instance()
             .get(&DataKey::Config(ConfigKey::FeeConfig))
             .ok_or(Error::Feature(FeatureError::FeeConfigNotFound))
+    }
+
+    /// Admin sets the maximum forward chain depth.
+    /// 
+    /// # Arguments
+    /// * `admin` - The admin address (must be in multisig config)
+    /// * `max_depth` - Maximum allowed hops in a forward chain (default: 5)
+    /// 
+    /// # Returns
+    /// `Ok(())` on success, or an error if unauthorized or contract is paused.
+    pub fn set_max_forward_depth(env: Env, admin: Address, max_depth: u32) -> Result<(), Error> {
+        Self::require_not_paused(&env, "set_max_forward_depth")?;
+        admin.require_auth();
+        let config: MultiSigConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config(ConfigKey::MultiSigConfig))
+            .ok_or(Error::Basic(BasicError::MultiSigNotInitialized))?;
+        if !config.admins.contains(&admin) {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::Config(ConfigKey::MaxForwardDepth), &max_depth);
+        Ok(())
+    }
+
+    /// Returns the maximum forward chain depth.
+    pub fn get_max_forward_depth(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::Config(ConfigKey::MaxForwardDepth))
+            .unwrap_or(5)
     }
 
     /// Calculates the fee for a given amount and merchant (accounting for tier discount and waivers).
@@ -10772,6 +10864,74 @@ impl PaymentContract {
         Ok(channel_id)
     }
 
+    /// Tops up an existing open payment channel with additional deposit.
+    ///
+    /// Allows a customer to add funds to a channel that has been drawn down,
+    /// avoiding the need to close and reopen a new channel for continued
+    /// micropayments.
+    ///
+    /// # Arguments
+    /// * `customer` - The channel's customer (must authorize).
+    /// * `channel_id` - The ID of the channel to top up.
+    /// * `amount` - Amount to add to the channel's deposit.
+    ///
+    /// # Returns
+    /// `Ok(())` on success.
+    ///
+    /// # Errors
+    /// Returns an error if the amount is non-positive, the channel is not found,
+    /// the caller is not the channel's customer, the channel is closed, or the
+    /// channel has expired.
+    pub fn top_up_channel(
+        env: Env,
+        customer: Address,
+        channel_id: u64,
+        amount: i128,
+    ) -> Result<(), Error> {
+        customer.require_auth();
+        if amount <= 0 {
+            return Err(Error::Basic(BasicError::InvalidAmount));
+        }
+
+        let mut channel: PaymentChannel = env
+            .storage()
+            .instance()
+            .get(&DataKey::Feature(FeatureKey::PaymentChannel(channel_id)))
+            .ok_or(Error::Feature(FeatureError::ChannelNotFound))?;
+
+        if channel.customer != customer {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+
+        if !channel.open {
+            return Err(Error::Feature(FeatureError::ChannelClosed));
+        }
+
+        if channel.expires_at > 0 && env.ledger().timestamp() > channel.expires_at {
+            return Err(Error::Feature(FeatureError::ChannelExpired));
+        }
+
+        let token_client = token::Client::new(&env, &channel.token);
+        let contract_address = env.current_contract_address();
+        token_client.transfer(&customer, &contract_address, &amount);
+
+        channel.deposited += amount;
+
+        env.storage().instance().set(
+            &DataKey::Feature(FeatureKey::PaymentChannel(channel_id)),
+            &channel,
+        );
+
+        (ChannelToppedUp {
+            channel_id,
+            amount,
+            new_deposited: channel.deposited,
+        })
+        .publish(&env);
+
+        Ok(())
+    }
+
     /// Settles a payment channel with a signed off-chain state update.
     ///
     /// Verifies the customer's signature over (channel_id, merchant_amount, nonce),
@@ -10816,7 +10976,7 @@ impl PaymentContract {
             return Err(Error::Feature(FeatureError::InvalidNonce));
         }
 
-        if merchant_amount > channel.deposited {
+        if merchant_amount < 0 || merchant_amount > channel.deposited {
             return Err(Error::Basic(BasicError::InvalidAmount));
         }
 
@@ -10830,6 +10990,17 @@ impl PaymentContract {
             .ed25519_verify(&channel.customer_pk, &msg, &signature);
 
         let customer_refund = channel.deposited - merchant_amount;
+
+        // Issue #385: assert the claimed settlement conserves the original deposit —
+        // the merchant's claim plus the customer's derived refund must sum exactly
+        // to what was deposited, never more.
+        if merchant_amount
+            .checked_add(customer_refund)
+            .ok_or(Error::Feature(FeatureError::BalanceSumMismatch))?
+            != channel.deposited
+        {
+            return Err(Error::Feature(FeatureError::BalanceSumMismatch));
+        }
         let token_client = token::Client::new(&env, &channel.token);
         let contract_address = env.current_contract_address();
 

@@ -107,11 +107,11 @@ Recommended migration path:
 
 ## 🔗 Links
 
-<!-- - [Website](https://facilpay.com) coming soon -->
-<!-- - [Documentation](https://docs.facilpay.com) coming soon -->
+- [Storage Versioning Guide](docs/STORAGE_VERSIONING.md)
 - Telegram: https://t.me/+afM9uh7GGtVkYmZk
 - [API Repository](https://github.com/facilpay/facilpay-api)
 - [SDK Repository](https://github.com/facilpay/facilpay-sdk)
+
 
 ## License
 
