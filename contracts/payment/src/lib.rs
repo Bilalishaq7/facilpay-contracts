@@ -2374,6 +2374,7 @@ impl PaymentContract {
         metadata: String,
     ) -> Result<u64, Error> {
         Self::require_not_paused(&env, "create_payment")?;
+        Self::require_merchant_not_paused(&env, &merchant)?;
         customer.require_auth();
         PaymentContract::do_create_payment(
             &env,
@@ -2715,6 +2716,7 @@ impl PaymentContract {
         expiration_duration: u64,
         metadata: String,
     ) -> Result<u64, Error> {
+        Self::require_merchant_not_paused(env, &merchant)?;
         if !PaymentContract::is_token_allowed(env, &token) {
             return Err(Error::Payment(PaymentError::TokenNotAllowed));
         }
@@ -3100,6 +3102,7 @@ impl PaymentContract {
         metadata: String,
         auto_release_on_complete: bool,
     ) -> Result<(u64, u64), Error> {
+        Self::require_merchant_not_paused(&env, &merchant)?;
         let payment_id = PaymentContract::create_payment(
             env.clone(),
             customer.clone(),
@@ -3184,6 +3187,7 @@ impl PaymentContract {
         if payment.status != PaymentStatus::Pending {
             return Err(Error::Payment(PaymentError::InvalidStatus));
         }
+        Self::require_merchant_not_paused(&env, &payment.merchant)?;
         PaymentContract::require_no_unresolved_escrowed_payment_dispute(&env, payment_id)?;
 
         // Released as this contract's own identity (not the human `admin`),
@@ -3387,6 +3391,7 @@ impl PaymentContract {
         if payment.status != PaymentStatus::Pending {
             return Err(Error::Payment(PaymentError::InvalidStatus));
         }
+        Self::require_merchant_not_paused(&env, &payment.merchant)?;
 
         let release_to_merchant = !favor_customer;
         let escrow_client = EscrowContractClient::new(&env, &bridge.escrow_contract);
@@ -6043,6 +6048,8 @@ impl PaymentContract {
                 subscription_id,
             )))
             .ok_or(Error::Subscription(SubscriptionError::MeteredNotFound))?;
+
+        Self::require_merchant_not_paused(&env, &sub.merchant)?;
 
         let units_billed = sub.accumulated_units;
         if units_billed == 0 {
@@ -10854,6 +10861,8 @@ impl PaymentContract {
             .get(&DataKey::Feature(FeatureKey::PaymentChannel(channel_id)))
             .ok_or(Error::Feature(FeatureError::ChannelNotFound))?;
 
+        Self::require_merchant_not_paused(&env, &channel.merchant)?;
+
         if !channel.open {
             return Err(Error::Feature(FeatureError::ChannelClosed));
         }
@@ -11040,6 +11049,7 @@ impl PaymentContract {
         token: Address,
         recipients: Vec<SplitRecipient>,
     ) -> Result<u64, Error> {
+        Self::require_merchant_not_paused(&env, &merchant)?;
         customer.require_auth();
 
         if recipients.len() > 10 {

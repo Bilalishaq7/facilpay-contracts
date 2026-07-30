@@ -1435,6 +1435,7 @@ impl RefundContract {
         reason_code: RefundReasonCode,
         payment_created_at: u64,
     ) -> Result<u64, Error> {
+        Self::require_not_paused(&env, "request_refund")?;
         // Require merchant authentication
         merchant.require_auth();
 
@@ -1501,6 +1502,7 @@ impl RefundContract {
     /// Returns `InvalidStatus` if the refund is not in `Requested` status.
     /// Returns `RefundWindowExpired` if the refund's TTL has expired.
     pub fn approve_refund(env: Env, admin: Address, refund_id: u64) -> Result<(), Error> {
+        Self::require_not_paused(&env, "approve_refund")?;
         // Require admin authentication
         admin.require_auth();
 
@@ -1526,6 +1528,7 @@ impl RefundContract {
         refund_id: u64,
         rejection_reason: String,
     ) -> Result<(), Error> {
+        Self::require_not_paused(&env, "reject_refund")?;
         // Require admin authentication
         admin.require_auth();
 
@@ -1662,6 +1665,7 @@ impl RefundContract {
         refund_id: u64,
         reason: String,
     ) -> Result<u64, Error> {
+        Self::require_not_paused(&env, "file_appeal")?;
         customer.require_auth();
 
         let refund: Refund = env
@@ -1928,6 +1932,7 @@ impl RefundContract {
     /// Returns `RefundExceedsPolicy` if the merchant quota is exceeded.
     /// Returns `TotalRefundsExceedPayment` if processing would exceed the original payment.
     pub fn process_refund(env: Env, admin: Address, refund_id: u64) -> Result<(), Error> {
+        Self::require_not_paused(&env, "process_refund")?;
         admin.require_auth();
 
         Self::process_refund_internal(&env, admin, refund_id)
