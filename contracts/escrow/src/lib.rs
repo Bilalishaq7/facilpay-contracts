@@ -30,12 +30,13 @@ pub enum ConfigKey {
     EscrowFeeConfig,
     StaleThresholdConfig,
     DisputeConfig,
-    InsurancePool,
+    InsurancePool(Address),
     InsuranceConfig,
     TimeLockConfig,
     AdminClawbackEscrow(u64),
     SchemaVersion,
     TrustedBridge(Address),
+    EvidenceDeadlineConfig,
 }
 
 #[derive(Clone)]
@@ -352,6 +353,7 @@ pub struct InsuranceClaim {
     pub escrow_id: u64,
     pub claimant: Address,
     pub amount: i128,
+    pub token: Address,
     pub approved: bool,
     pub paid_at: Option<u64>,
 }
@@ -737,6 +739,12 @@ pub struct DisputeConfig {
     pub collateral_amount: i128,
     pub collateral_enabled: bool,
     pub min_collateral_ratio_bps: u32,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub struct EvidenceDeadlineConfig {
+    pub evidence_deadline_seconds: u64,
 }
 
 #[derive(Clone)]
@@ -3912,7 +3920,7 @@ impl EscrowContract {
                 escrow.status = EscrowStatus::Resolved;
             }
             EscrowStatus::Disputed => {
-                escrow.status = EscrowStatus::Resolved;
+                return Err(Error::Escrow(EscrowError::InvalidStatus));
             }
             EscrowStatus::Released | EscrowStatus::Resolved | EscrowStatus::Cancelled => {
                 return Err(Error::Escrow(EscrowError::AlreadyProcessed))
@@ -4012,8 +4020,9 @@ impl EscrowContract {
                 escrow.status = EscrowStatus::Disputed;
                 escrow.dispute_started_at = env.ledger().timestamp();
                 escrow.last_activity_at = escrow.dispute_started_at;
-                // Set evidence submission deadline to 7 days from dispute start
-                let evidence_deadline_seconds = 7 * 24 * 60 * 60; // 7 days
+                // Set evidence submission deadline from the configured window
+                let evidence_deadline_seconds =
+                    Self::get_evidence_deadline_config(env.clone()).evidence_deadline_seconds;
                 escrow.evidence_deadline =
                     Some(escrow.dispute_started_at + evidence_deadline_seconds);
 
@@ -8441,22 +8450,23 @@ impl EscrowContract {
         Ok(())
     }
 
-    /// Returns insurance pool.
+    /// Returns insurance pool for a given token.
     ///
     /// # Arguments
     /// * `env` - Soroban environment.
+    /// * `token` - Token address of the pool bucket to fetch.
     ///
     /// # Returns
     /// The requested InsurancePool value.
     ///
     /// # Panics
     /// Panics if required state is missing.
-    pub fn get_insurance_pool(env: Env) -> InsurancePool {
+    pub fn get_insurance_pool(env: Env, token: Address) -> InsurancePool {
         env.storage()
             .instance()
-            .get(&DataKey::Config(ConfigKey::InsurancePool))
+            .get(&DataKey::Config(ConfigKey::InsurancePool(token.clone())))
             .unwrap_or(InsurancePool {
-                token: env.current_contract_address(), // dummy default
+                token,
                 balance: 0,
                 total_premiums_collected: 0,
                 total_claims_paid: 0,
@@ -8499,13 +8509,13 @@ impl EscrowContract {
             .instance()
             .set(&DataKey::Escrow(EscrowKey::Data(escrow_id)), &escrow);
 
-        let mut pool = Self::get_insurance_pool(env.clone());
-        pool.token = escrow.token.clone();
+        let mut pool = Self::get_insurance_pool(env.clone(), escrow.token.clone());
         pool.balance += premium;
         pool.total_premiums_collected += premium;
-        env.storage()
-            .instance()
-            .set(&DataKey::Config(ConfigKey::InsurancePool), &pool);
+        env.storage().instance().set(
+            &DataKey::Config(ConfigKey::InsurancePool(escrow.token.clone())),
+            &pool,
+        );
 
         Ok(())
     }
@@ -8561,6 +8571,7 @@ impl EscrowContract {
             escrow_id,
             claimant: escrow.customer.clone(), // default to customer
             amount,
+            token: escrow.token.clone(),
             approved: false,
             paid_at: None,
         };
@@ -8605,7 +8616,7 @@ impl EscrowContract {
             return Err(Error::Escrow(EscrowError::AlreadyProcessed));
         }
 
-        let mut pool = Self::get_insurance_pool(env.clone());
+        let mut pool = Self::get_insurance_pool(env.clone(), claim.token.clone());
         if pool.balance < claim.amount {
             return Err(Error::Escrow(EscrowError::InvalidStatus));
         }
@@ -8614,9 +8625,10 @@ impl EscrowContract {
 
         pool.balance -= claim.amount;
         pool.total_claims_paid += claim.amount;
-        env.storage()
-            .instance()
-            .set(&DataKey::Config(ConfigKey::InsurancePool), &pool);
+        env.storage().instance().set(
+            &DataKey::Config(ConfigKey::InsurancePool(claim.token.clone())),
+            &pool,
+        );
 
         claim.approved = true;
         claim.paid_at = Some(env.ledger().timestamp());
@@ -8815,6 +8827,50 @@ impl EscrowContract {
                 collateral_amount: 0,
                 collateral_enabled: false,
                 min_collateral_ratio_bps: 15000, // Default 150%
+            })
+    }
+
+    /// Sets the evidence submission deadline config.
+    ///
+    /// # Arguments
+    /// * `env` - Soroban environment.
+    /// * `admin` - Address of the signer or participant.
+    /// * `config` - Configuration data for the requested feature.
+    ///
+    /// # Returns
+    /// Results in `Ok(())` on success or `Err(Error)` on failure.
+    ///
+    /// # Errors
+    /// Returns `Err(Error)` when the operation cannot be completed.
+    pub fn set_evidence_deadline_config(
+        env: Env,
+        admin: Address,
+        config: EvidenceDeadlineConfig,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        let multisig = Self::get_multisig_config(env.clone());
+        if !multisig.admins.contains(&admin) {
+            return Err(Error::Basic(BasicError::NotAnAdmin));
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::Config(ConfigKey::EvidenceDeadlineConfig), &config);
+        Ok(())
+    }
+
+    /// Returns the evidence submission deadline config.
+    ///
+    /// # Arguments
+    /// * `env` - Soroban environment.
+    ///
+    /// # Returns
+    /// The requested EvidenceDeadlineConfig value.
+    pub fn get_evidence_deadline_config(env: Env) -> EvidenceDeadlineConfig {
+        env.storage()
+            .instance()
+            .get(&DataKey::Config(ConfigKey::EvidenceDeadlineConfig))
+            .unwrap_or(EvidenceDeadlineConfig {
+                evidence_deadline_seconds: 7 * 24 * 60 * 60, // Default 7 days
             })
     }
 
