@@ -3449,6 +3449,117 @@ impl EscrowContract {
             .ok_or(Error::Escrow(EscrowError::NotFound))
     }
 
+    /// Cancels a multi-party escrow and refunds the full amount to the customer.
+    ///
+    /// This can only be called by the original customer after the `release_timestamp`
+    /// has passed, and only if the escrow is still in a `Locked` state (i.e., not
+    /// released, disputed, or already cancelled).
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment.
+    /// * `customer` - The customer who created the escrow (must authorize).
+    /// * `escrow_id` - The ID of the multi-party escrow to cancel.
+    ///
+    /// # Returns
+    /// `Ok(())` on success.
+    ///
+    /// # Errors
+    /// Returns an error if the escrow is not found, the caller is not the customer,
+    /// the escrow is not in a cancellable state, or the release time has not passed.
+    pub fn cancel_multi_party_escrow(
+        env: Env,
+        customer: Address,
+        escrow_id: u64,
+    ) -> Result<(), Error> {
+        customer.require_auth();
+
+        let mut escrow: MultiPartyEscrow = env
+            .storage()
+            .instance()
+            .get(&DataKey::Escrow(EscrowKey::MultiParty(escrow_id)))
+            .ok_or(Error::Escrow(EscrowError::NotFound))?;
+
+        if escrow.status != EscrowStatus::Locked {
+            return Err(Error::Escrow(EscrowError::InvalidStatus));
+        }
+
+        if env.ledger().timestamp() < escrow.release_timestamp {
+            return Err(Error::Escrow(EscrowError::ReleaseNotYetAvailable));
+        }
+
+        escrow.status = EscrowStatus::Cancelled;
+        env.storage()
+            .instance()
+            .set(&DataKey::Escrow(EscrowKey::MultiParty(escrow_id)), &escrow);
+
+        let token_client = token::Client::new(&env, &escrow.token);
+        token_client.transfer(
+            &env.current_contract_address(),
+            &customer,
+            &escrow.total_amount,
+        );
+
+        Ok(())
+    }
+
+    /// Cancels a multi-token escrow and refunds all tokens to the customer.
+    ///
+    /// This can only be called by the original customer after the `release_timestamp`
+    /// has passed, and only if the escrow is still in a `Locked` state.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment.
+    /// * `customer` - The customer who created the escrow (must authorize).
+    /// * `escrow_id` - The ID of the multi-token escrow to cancel.
+    ///
+    /// # Returns
+    /// `Ok(())` on success.
+    ///
+    /// # Errors
+    /// Returns an error if the escrow is not found, the caller is not the customer,
+    /// the escrow is not in a cancellable state, or the release time has not passed.
+    pub fn cancel_multi_token_escrow(
+        env: Env,
+        customer: Address,
+        escrow_id: u64,
+    ) -> Result<(), Error> {
+        customer.require_auth();
+
+        let mut escrow: MultiTokenEscrow = env
+            .storage()
+            .instance()
+            .get(&DataKey::Escrow(EscrowKey::MultiToken(escrow_id)))
+            .ok_or(Error::Escrow(EscrowError::NotFound))?;
+
+        if escrow.customer != customer {
+            return Err(Error::Basic(BasicError::Unauthorized));
+        }
+
+        if escrow.status != EscrowStatus::Locked {
+            return Err(Error::Escrow(EscrowError::InvalidStatus));
+        }
+
+        if env.ledger().timestamp() < escrow.release_timestamp {
+            return Err(Error::Escrow(EscrowError::ReleaseNotYetAvailable));
+        }
+
+        escrow.status = EscrowStatus::Cancelled;
+        env.storage()
+            .instance()
+            .set(&DataKey::Escrow(EscrowKey::MultiToken(escrow_id)), &escrow);
+
+        for entry in escrow.tokens.iter() {
+            let token_client = token::Client::new(&env, &entry.token);
+            token_client.transfer(
+                &env.current_contract_address(),
+                &customer,
+                &entry.amount,
+            );
+        }
+
+        Ok(())
+    }
+
     /// Returns escrow.
     ///
     /// # Arguments
@@ -3462,6 +3573,7 @@ impl EscrowContract {
     /// Panics if required state is missing.
     pub fn get_escrow(env: &Env, escrow_id: u64) -> Escrow {
         env.storage()
+        let escrow: Escrow = env.storage()
             .instance()
             .get(&DataKey::Escrow(EscrowKey::Data(escrow_id)))
             .expect("Escrow not found")
