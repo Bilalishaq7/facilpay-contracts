@@ -80,6 +80,7 @@ pub enum DataKey {
     // Payment refund caps
     PaymentRefundCap(u64),
     PaymentRefundUsage(u64),
+    AutoApproveBelowCeiling,
     // Issue #370: Customer-tier-based refund caps
     CustomerTier(Address),
     CustomerTierPolicy(Address, u32),
@@ -258,6 +259,7 @@ pub enum CoreError {
     CircuitBreakerTripped = 29,
     InvalidFeeConfig = 30,
     InsufficientTreasuryFees = 31,
+    AutoApproveThresholdExceedsCeiling = 32,
 }
 
 #[contracterror]
@@ -1383,6 +1385,7 @@ impl RefundContract {
         Self::set_inherit_from_parent_inner(&env, &admin, false);
         Self::set_requires_admin_approval_inner(&env, &admin, true);
         Self::set_auto_approve_below_inner(&env, &admin, 0);
+        Self::set_auto_approve_below_ceiling_inner(&env, 0);
         env.storage()
             .instance()
             .set(&DataKey::AppealWindowSeconds, &604800u64);
@@ -4547,6 +4550,19 @@ impl RefundContract {
         env.storage().instance().set(&composite_key, &value);
     }
 
+    fn get_auto_approve_below_ceiling_inner(env: &Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::AutoApproveBelowCeiling)
+            .unwrap_or(0)
+    }
+
+    fn set_auto_approve_below_ceiling_inner(env: &Env, value: i128) {
+        env.storage()
+            .instance()
+            .set(&DataKey::AutoApproveBelowCeiling, &value);
+    }
+
     fn get_inherit_from_parent_inner(env: &Env, merchant: &Address) -> bool {
         let key = Symbol::new(env, "inherit_from_parent");
         let composite_key: (Symbol, Address) = (key, merchant.clone());
@@ -4602,9 +4618,44 @@ impl RefundContract {
     /// # Arguments
     /// * `merchant` - The merchant address to configure (must authenticate).
     /// * `value` - The threshold amount below which refunds are auto-approved.
-    pub fn set_auto_approve_below(env: Env, merchant: Address, value: i128) {
+    pub fn set_auto_approve_below(env: Env, merchant: Address, value: i128) -> Result<(), Error> {
         merchant.require_auth();
+        let ceiling = Self::get_auto_approve_below_ceiling_inner(&env);
+        if value > ceiling {
+            return Err(Error::Core(CoreError::AutoApproveThresholdExceedsCeiling));
+        }
         Self::set_auto_approve_below_inner(&env, &merchant, value);
+        Ok(())
+    }
+
+    /// Get the platform-wide ceiling for merchant auto-approval thresholds.
+    ///
+    /// Refund thresholds above this value are rejected by `set_auto_approve_below()`.
+    pub fn get_auto_approve_below_ceiling(env: Env) -> i128 {
+        Self::get_auto_approve_below_ceiling_inner(&env)
+    }
+
+    /// Set the platform-wide ceiling for merchant auto-approval thresholds.
+    ///
+    /// # Arguments
+    /// * `admin` - The contract admin configuring the ceiling.
+    /// * `value` - The maximum auto-approval threshold any merchant may set.
+    pub fn set_auto_approve_below_ceiling(
+        env: Env,
+        admin: Address,
+        value: i128,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Core(CoreError::Unauthorized))?;
+        if admin != stored_admin {
+            return Err(Error::Core(CoreError::Unauthorized));
+        }
+        Self::set_auto_approve_below_ceiling_inner(&env, value);
+        Ok(())
     }
 
     /// Check whether a merchant inherits its refund policy from its parent merchant.
@@ -4616,6 +4667,49 @@ impl RefundContract {
     /// `true` if inheritance is enabled (the default), `false` otherwise.
     pub fn get_inherit_from_parent(env: Env, merchant: Address) -> bool {
         Self::get_inherit_from_parent_inner(&env, &merchant)
+    }
+
+    /// Set whether a merchant inherits its refund policy from its parent merchant.
+    ///
+    /// # Arguments
+    /// * `merchant` - The merchant address to configure (must authenticate).
+    /// * `inherit` - `true` to enable inheritance, `false` to disable it.
+    pub fn set_inherit_from_parent(env: Env, merchant: Address, inherit: bool) {
+        merchant.require_auth();
+        Self::set_inherit_from_parent_inner(&env, &merchant, inherit);
+    }
+
+    /// Deactivate a merchant's refund policy so it is no longer enforced.
+    ///
+    /// # Arguments
+    /// * `merchant` - The merchant whose policy should be deactivated (must authenticate).
+    ///
+    /// # Errors
+    /// Returns `PolicyNotFound` if no policy exists for the merchant.
+    /// Returns `PolicyInactive` if the policy is already inactive.
+    pub fn deactivate_refund_policy(env: Env, merchant: Address) -> Result<(), Error> {
+        // Require merchant authentication
+        merchant.require_auth();
+
+        let mut policy: RefundPolicy = env
+            .storage()
+            .instance()
+            .get(&DataKey::RefundPolicy(merchant.clone()))
+            .ok_or(Error::Core(CoreError::PolicyNotFound))?;
+
+        if !policy.active {
+            return Err(Error::Core(CoreError::PolicyInactive));
+        }
+
+        policy.active = false;
+        env.storage()
+            .instance()
+            .set(&DataKey::RefundPolicy(merchant.clone()), &policy);
+
+        // Emit RefundPolicyDeactivated event
+        (RefundPolicyDeactivated { merchant }).publish(&env);
+
+        Ok(())
     }
 
     /// Set whether a merchant inherits its refund policy from its parent merchant.
@@ -5447,7 +5541,12 @@ impl RefundContract {
             };
             let requires_approval =
                 Self::get_requires_admin_approval_inner(&env, &effective_merchant);
-            let auto_below = Self::get_auto_approve_below_inner(&env, &effective_merchant);
+            let auto_below = {
+                let merchant_threshold =
+                    Self::get_auto_approve_below_inner(&env, &effective_merchant);
+                let platform_ceiling = Self::get_auto_approve_below_ceiling_inner(&env);
+                core::cmp::min(merchant_threshold, platform_ceiling)
+            };
             if !requires_approval && amount <= auto_below {
                 RefundStatus::Approved
             } else {
@@ -8573,94 +8672,4 @@ impl RefundContract {
     /// Enable or disable strict tier policy enforcement for a merchant.
     ///
     /// When strict mode is enabled, customers without an assigned tier are
-    /// denied refunds instead of falling back to default behavior.
-    ///
-    /// # Arguments
-    /// * `merchant` - The merchant to configure (must authenticate).
-    /// * `strict` - `true` to enable strict mode, `false` to disable it.
-    pub fn set_strict_tier_policy(
-        env: Env,
-        merchant: Address,
-        strict: bool,
-    ) -> Result<(), Error> {
-        merchant.require_auth();
-        env.storage()
-            .instance()
-            .set(&DataKey::StrictTierPolicy(merchant), &strict);
-        Ok(())
-    }
-
-    /// Check whether strict tier policy enforcement is enabled for a merchant.
-    ///
-    /// # Arguments
-    /// * `merchant` - The merchant to query.
-    ///
-    /// # Returns
-    /// `true` if strict mode is enabled, `false` otherwise (the default).
-    pub fn get_strict_tier_policy(env: Env, merchant: Address) -> bool {
-        env.storage()
-            .instance()
-            .get(&DataKey::StrictTierPolicy(merchant))
-            .unwrap_or(false)
-    }
-}
-
-mod test;
-mod test_policy;
-mod test_process;
-mod test_rate_limit;
-
-#[cfg(test)]
-mod test_payment_refund_cap;
-
-#[cfg(test)]
-mod test_circuit_breaker;
-
-// #[cfg(test)]
-// mod test_versioning;
-
-#[cfg(test)]
-mod test_batch;
-
-#[cfg(test)]
-mod test_cross_contract;
-
-#[cfg(test)]
-mod test_arbitration_fees;
-
-#[cfg(test)]
-mod test_arbitration_stake;
-
-#[cfg(test)]
-mod test_arbitrator_reputation;
-
-#[cfg(test)]
-mod test_auto_refund;
-
-#[cfg(test)]
-mod test_inheritance;
-
-mod test_customer_history;
-#[cfg(test)]
-mod test_notification_hooks;
-
-#[cfg(test)]
-mod test_arbitration_timeout;
-
-#[cfg(test)]
-mod test_merchant_eligibility;
-
-#[cfg(test)]
-mod test_customer_tier_policy;
-
-#[cfg(test)]
-mod test_voucher_expiry;
-
-#[cfg(test)]
-mod schema_version_test;
-
-#[cfg(test)]
-mod test_merchant_override_and_error_codes;
-
-#[cfg(test)]
-mod test_admin_rotation;
+    /// denied refunds inst

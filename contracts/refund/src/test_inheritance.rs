@@ -20,6 +20,7 @@ fn test_single_level_inheritance() {
     client.initialize(&admin);
 
     env.mock_all_auths();
+    client.set_auto_approve_below_ceiling(&admin, &1000i128);
 
     // Parent sets their own policy
     let tiers = Vec::from_array(
@@ -128,6 +129,7 @@ fn test_child_override_priority() {
     );
     client.set_refund_policy(&child_merchant, &child_tiers);
     client.set_requires_admin_approval(&child_merchant, &false);
+    client.set_auto_approve_below_ceiling(&admin, &1000i128);
     client.set_auto_approve_below(&child_merchant, &100i128);
 
     // Child policy should be returned, not parent's
@@ -485,6 +487,7 @@ fn test_parent_updates_existing_policy() {
     client.initialize(&admin);
 
     env.mock_all_auths();
+    client.set_auto_approve_below_ceiling(&admin, &1000i128);
 
     // Child sets policy first (no parent yet)
     let tiers = Vec::from_array(
