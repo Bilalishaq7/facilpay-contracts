@@ -3147,10 +3147,8 @@ impl PaymentContract {
             &bridge,
         );
 
-        // Custody is shifted to escrow contract account on creation.
-        let token_client = token::Client::new(&env, &token);
-        let contract_address = env.current_contract_address();
-        token_client.transfer_from(&contract_address, &customer, &escrow_contract, &amount);
+        // Custody is already shifted to the escrow contract by `invoke_escrow_create`
+        // above, which transfers `amount` from `customer` as part of creating the escrow.
 
         (EscrowedPaymentCreated {
             payment_id,
@@ -3856,6 +3854,12 @@ impl PaymentContract {
             }
         }
 
+        // Carve out the portion (if any) that an active auto-escrow rule will route
+        // to the escrow contract, so the merchant is only paid what remains. The
+        // carved-out amount is transferred to escrow later by `trigger_auto_escrow`.
+        let escrow_carveout = PaymentContract::get_auto_escrow_carveout(env, &payment);
+        let merchant_amount = net_amount - escrow_carveout;
+
         // Token transfer: net amount from customer to merchant
         let token_client = token::Client::new(env, &payment.token);
         let contract_address = env.current_contract_address();
@@ -3864,7 +3868,7 @@ impl PaymentContract {
             &contract_address,
             &payment.customer,
             &payment.merchant,
-            &net_amount,
+            &merchant_amount,
         );
 
         // Check if merchant has an active payment forward config
@@ -3873,7 +3877,8 @@ impl PaymentContract {
         {
             if forward_config.active {
                 // Calculate the forward amount based on forward_bps
-                let forward_amount = (net_amount * (forward_config.forward_bps as i128)) / 10000;
+                let forward_amount =
+                    (merchant_amount * (forward_config.forward_bps as i128)) / 10000;
 
                 // Transfer the forward amount from merchant to forward_to address
                 if forward_amount > 0 {
@@ -9926,6 +9931,36 @@ impl PaymentContract {
     /// # Errors
     /// Returns an error if the payment is not found, escrow was already triggered,
     /// the rule is not found/inactive, or token/amount requirements are not met.
+    /// Returns the amount that an active, matching, not-yet-triggered auto-escrow
+    /// rule would carve out of `payment` for escrow, or 0 if no rule applies.
+    fn get_auto_escrow_carveout(env: &Env, payment: &Payment) -> i128 {
+        if env
+            .storage()
+            .instance()
+            .has(&DataKey::State(StateDataKey::AutoEscrowTriggered(
+                payment.id,
+            )))
+        {
+            return 0;
+        }
+
+        let rule = match env
+            .storage()
+            .instance()
+            .get::<DataKey, AutoEscrowRule>(&DataKey::State(StateDataKey::AutoEscrowRule(
+                payment.merchant.clone(),
+            ))) {
+            Some(rule) => rule,
+            None => return 0,
+        };
+
+        if !rule.active || payment.amount < rule.min_amount || payment.token != rule.token {
+            return 0;
+        }
+
+        (payment.amount * (rule.escrow_bps as i128)) / 10000i128
+    }
+
     pub fn trigger_auto_escrow(env: &Env, payment_id: u64) -> Result<(), Error> {
         // Check if payment exists
         if !env
@@ -9976,7 +10011,10 @@ impl PaymentContract {
 
         // Calculate escrow amount based on bps (basis points)
         // escrow_bps is in basis points, so divide by 10000
-        let escrow_amount = (payment.amount * (rule.escrow_bps as i128)) / 10000i128;
+        let escrow_amount = PaymentContract::get_auto_escrow_carveout(env, &payment);
+        if escrow_amount == 0 {
+            return Ok(());
+        }
 
         // Create escrow using the escrow contract
         let escrow_client = EscrowContractClient::new(&env, &rule.escrow_contract);
@@ -10009,6 +10047,20 @@ impl PaymentContract {
         })
         .publish(&env);
 
+        Ok(())
+    }
+
+    fn require_merchant_not_paused(env: &Env, merchant: &Address) -> Result<(), Error> {
+        let merchant_paused: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::Merchant(MerchantDataKey::MerchantPaused(
+                merchant.clone(),
+            )))
+            .unwrap_or(false);
+        if merchant_paused {
+            return Err(Error::Subscription(SubscriptionError::MerchantPaused));
+        }
         Ok(())
     }
 

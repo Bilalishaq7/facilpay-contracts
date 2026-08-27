@@ -2,8 +2,7 @@
 
 use crate::*;
 use soroban_sdk::testutils::Ledger;
-use crate::*;
-use soroban_sdk::{testutils::Address as _, vec, Address, BytesN, Env};
+use soroban_sdk::{testutils::Address as _, token, vec, Address, BytesN, Env};
 
 fn setup(env: &Env) -> (EscrowContractClient, Address, Address, Address, Address) {
     env.mock_all_auths();
@@ -13,7 +12,9 @@ fn setup(env: &Env) -> (EscrowContractClient, Address, Address, Address, Address
     client.initialize(&admin);
     let customer = Address::generate(env);
     let merchant = Address::generate(env);
-    let token = Address::generate(env);
+    let token = env.register_stellar_asset_contract(admin.clone());
+    let token_admin = token::StellarAssetClient::new(env, &token);
+    token_admin.mint(&customer, &1_000_000);
     (client, admin, customer, merchant, token)
 }
 

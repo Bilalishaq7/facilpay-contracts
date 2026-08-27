@@ -2,7 +2,7 @@
 
 use crate::*;
 use soroban_sdk::testutils::Ledger;
-use soroban_sdk::{testutils::Address as _, Address, Env};
+use soroban_sdk::{testutils::Address as _, token, Address, Env};
 
 fn setup(
     env: &Env,
@@ -20,7 +20,9 @@ fn setup(
     client.initialize(&admin);
     let customer = Address::generate(env);
     let merchant = Address::generate(env);
-    let token = Address::generate(env);
+    let token = env.register_stellar_asset_contract(admin.clone());
+    let token_admin = token::StellarAssetClient::new(env, &token);
+    token_admin.mint(&customer, &1_000_000);
     (client, admin, customer, merchant, token)
 }
 

@@ -1,7 +1,7 @@
 #![cfg(test)]
 
 use super::*;
-use soroban_sdk::{contract, contractimpl, testutils::Address as _, Address, Env};
+use soroban_sdk::{contract, contractimpl, testutils::Address as _, token, Address, Env};
 
 #[contract]
 pub struct MockSwapOracle;
@@ -30,7 +30,9 @@ fn test_escrow_swap_successful() {
     let admin = Address::generate(&env);
     let customer = Address::generate(&env);
     let merchant = Address::generate(&env);
-    let token = Address::generate(&env);
+    let token = env.register_stellar_asset_contract(admin.clone());
+    let token_admin_client = token::StellarAssetClient::new(&env, &token);
+    token_admin_client.mint(&customer, &1_000_000);
     let target_token = Address::generate(&env);
     let oracle = env.register(MockSwapOracle, ());
     let oracle_client = MockSwapOracleClient::new(&env, &oracle);
@@ -81,7 +83,9 @@ fn test_escrow_swap_successful_by_admin() {
     let admin = Address::generate(&env);
     let customer = Address::generate(&env);
     let merchant = Address::generate(&env);
-    let token = Address::generate(&env);
+    let token = env.register_stellar_asset_contract(admin.clone());
+    let token_admin_client = token::StellarAssetClient::new(&env, &token);
+    token_admin_client.mint(&customer, &1_000_000);
     let target_token = Address::generate(&env);
     let oracle = env.register(MockSwapOracle, ());
     let oracle_client = MockSwapOracleClient::new(&env, &oracle);
@@ -116,7 +120,9 @@ fn test_escrow_swap_below_minimum_fails() {
     let admin = Address::generate(&env);
     let customer = Address::generate(&env);
     let merchant = Address::generate(&env);
-    let token = Address::generate(&env);
+    let token = env.register_stellar_asset_contract(admin.clone());
+    let token_admin_client = token::StellarAssetClient::new(&env, &token);
+    token_admin_client.mint(&customer, &1_000_000);
     let target_token = Address::generate(&env);
     let oracle = env.register(MockSwapOracle, ());
     let oracle_client = MockSwapOracleClient::new(&env, &oracle);
@@ -151,7 +157,9 @@ fn test_escrow_swap_double_execution_fails() {
     let admin = Address::generate(&env);
     let customer = Address::generate(&env);
     let merchant = Address::generate(&env);
-    let token = Address::generate(&env);
+    let token = env.register_stellar_asset_contract(admin.clone());
+    let token_admin_client = token::StellarAssetClient::new(&env, &token);
+    token_admin_client.mint(&customer, &1_000_000);
     let target_token = Address::generate(&env);
     let oracle = env.register(MockSwapOracle, ());
     let oracle_client = MockSwapOracleClient::new(&env, &oracle);
@@ -189,7 +197,9 @@ fn test_escrow_swap_unauthorized_config_fails() {
     let customer = Address::generate(&env);
     let merchant = Address::generate(&env);
     let unauthorized_caller = Address::generate(&env);
-    let token = Address::generate(&env);
+    let token = env.register_stellar_asset_contract(admin.clone());
+    let token_admin_client = token::StellarAssetClient::new(&env, &token);
+    token_admin_client.mint(&customer, &1_000_000);
     let target_token = Address::generate(&env);
     let oracle = env.register(MockSwapOracle, ());
 
@@ -221,7 +231,9 @@ fn test_escrow_swap_unauthorized_execute_fails() {
     let customer = Address::generate(&env);
     let merchant = Address::generate(&env);
     let unauthorized_caller = Address::generate(&env);
-    let token = Address::generate(&env);
+    let token = env.register_stellar_asset_contract(admin.clone());
+    let token_admin_client = token::StellarAssetClient::new(&env, &token);
+    token_admin_client.mint(&customer, &1_000_000);
     let target_token = Address::generate(&env);
     let oracle = env.register(MockSwapOracle, ());
 
@@ -248,7 +260,9 @@ fn test_escrow_swap_config_not_found_fails() {
     let admin = Address::generate(&env);
     let customer = Address::generate(&env);
     let merchant = Address::generate(&env);
-    let token = Address::generate(&env);
+    let token = env.register_stellar_asset_contract(admin.clone());
+    let token_admin_client = token::StellarAssetClient::new(&env, &token);
+    token_admin_client.mint(&customer, &1_000_000);
 
     client.initialize(&admin);
 
@@ -271,7 +285,9 @@ fn swap_rolls_back_when_second_leg_fails() {
     let admin = Address::generate(&env);
     let customer = Address::generate(&env);
     let merchant = Address::generate(&env);
-    let token = Address::generate(&env);
+    let token = env.register_stellar_asset_contract(admin.clone());
+    let token_admin_client = token::StellarAssetClient::new(&env, &token);
+    token_admin_client.mint(&customer, &1_000_000);
     let target_token = Address::generate(&env);
     let oracle = env.register(MockSwapOracle, ());
     let oracle_client = MockSwapOracleClient::new(&env, &oracle);
@@ -320,7 +336,9 @@ fn both_legs_succeed_funds_exchanged_correctly() {
     let admin = Address::generate(&env);
     let customer = Address::generate(&env);
     let merchant = Address::generate(&env);
-    let token = Address::generate(&env);
+    let token = env.register_stellar_asset_contract(admin.clone());
+    let token_admin_client = token::StellarAssetClient::new(&env, &token);
+    token_admin_client.mint(&customer, &1_000_000);
     let target_token = Address::generate(&env);
     let oracle = env.register(MockSwapOracle, ());
     let oracle_client = MockSwapOracleClient::new(&env, &oracle);
@@ -362,7 +380,9 @@ fn swap_cannot_be_claimed_by_non_participant() {
     let customer = Address::generate(&env);
     let merchant = Address::generate(&env);
     let non_participant = Address::generate(&env);
-    let token = Address::generate(&env);
+    let token = env.register_stellar_asset_contract(admin.clone());
+    let token_admin_client = token::StellarAssetClient::new(&env, &token);
+    token_admin_client.mint(&customer, &1_000_000);
     let target_token = Address::generate(&env);
     let oracle = env.register(MockSwapOracle, ());
 

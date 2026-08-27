@@ -3581,7 +3581,6 @@ impl EscrowContract {
     /// Panics if required state is missing.
     pub fn get_escrow(env: &Env, escrow_id: u64) -> Escrow {
         env.storage()
-        let escrow: Escrow = env.storage()
             .instance()
             .get(&DataKey::Escrow(EscrowKey::Data(escrow_id)))
             .expect("Escrow not found")

@@ -207,7 +207,8 @@ fn test_trigger_arbitration_timeout_settles_stake() {
         },
     );
 
-    // Configure a treasury to receive forfeited stakes.
+    // Configure a treasury to receive forfeited stakes. `fee_per_case` must stay
+    // at or below the escalation fee that `create_open_case` pays (300).
     client.set_arbitration_fee_config(
         &admin,
         &ArbitrationFeeConfig {
@@ -215,7 +216,7 @@ fn test_trigger_arbitration_timeout_settles_stake() {
             treasury_share_bps: 3000,
             treasury_address: treasury.clone(),
             fee_token: token_client.address.clone(),
-            fee_per_case: 1000,
+            fee_per_case: 100,
         },
     );
 

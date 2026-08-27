@@ -5127,6 +5127,18 @@ fn test_fee_deducted_from_payment_amount() {
     };
     client.set_fee_config(&admin, &fee_config);
 
+    // Disable risk-based fee surcharges so only `fee_bps` determines the fee.
+    client.set_risk_fee_config(
+        &admin,
+        &RiskFeeConfig {
+            base_fee_bps: 0,
+            large_amount_threshold: i128::MAX,
+            large_amount_surcharge_bps: 0,
+            new_customer_surcharge_bps: 0,
+            high_risk_currency_surcharge: 0,
+        },
+    );
+
     token_client.mint(&customer, &amount);
     token_user_client.approve(&customer, &contract_id, &amount, &200);
 
@@ -5601,6 +5613,18 @@ fn test_withdraw_fees_to_treasury() {
         active: true,
     };
     client.set_fee_config(&admin, &fee_config);
+
+    // Disable risk-based fee surcharges so only `fee_bps` determines the fee.
+    client.set_risk_fee_config(
+        &admin,
+        &RiskFeeConfig {
+            base_fee_bps: 0,
+            large_amount_threshold: i128::MAX,
+            large_amount_surcharge_bps: 0,
+            new_customer_surcharge_bps: 0,
+            high_risk_currency_surcharge: 0,
+        },
+    );
 
     token_client.mint(&customer, &amount);
     token_user_client.approve(&customer, &contract_id, &amount, &200);

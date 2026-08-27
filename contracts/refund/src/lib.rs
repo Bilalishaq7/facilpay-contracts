@@ -4712,49 +4712,6 @@ impl RefundContract {
         Ok(())
     }
 
-    /// Set whether a merchant inherits its refund policy from its parent merchant.
-    ///
-    /// # Arguments
-    /// * `merchant` - The merchant address to configure (must authenticate).
-    /// * `inherit` - `true` to enable inheritance, `false` to disable it.
-    pub fn set_inherit_from_parent(env: Env, merchant: Address, inherit: bool) {
-        merchant.require_auth();
-        Self::set_inherit_from_parent_inner(&env, &merchant, inherit);
-    }
-
-    /// Deactivate a merchant's refund policy so it is no longer enforced.
-    ///
-    /// # Arguments
-    /// * `merchant` - The merchant whose policy should be deactivated (must authenticate).
-    ///
-    /// # Errors
-    /// Returns `PolicyNotFound` if no policy exists for the merchant.
-    /// Returns `PolicyInactive` if the policy is already inactive.
-    pub fn deactivate_refund_policy(env: Env, merchant: Address) -> Result<(), Error> {
-        // Require merchant authentication
-        merchant.require_auth();
-
-        let mut policy: RefundPolicy = env
-            .storage()
-            .instance()
-            .get(&DataKey::RefundPolicy(merchant.clone()))
-            .ok_or(Error::Core(CoreError::PolicyNotFound))?;
-
-        if !policy.active {
-            return Err(Error::Core(CoreError::PolicyInactive));
-        }
-
-        policy.active = false;
-        env.storage()
-            .instance()
-            .set(&DataKey::RefundPolicy(merchant.clone()), &policy);
-
-        // Emit RefundPolicyDeactivated event
-        (RefundPolicyDeactivated { merchant }).publish(&env);
-
-        Ok(())
-    }
-
     /// Override a refund decision as an admin and create an immutable audit log entry.
     ///
     /// Records the override with a SHA-256 transaction hash for integrity verification.
@@ -8687,4 +8644,94 @@ impl RefundContract {
     /// Enable or disable strict tier policy enforcement for a merchant.
     ///
     /// When strict mode is enabled, customers without an assigned tier are
-    /// denied refunds inst
+    /// denied refunds instead of falling back to default behavior.
+    ///
+    /// # Arguments
+    /// * `merchant` - The merchant to configure (must authenticate).
+    /// * `strict` - `true` to enable strict mode, `false` to disable it.
+    pub fn set_strict_tier_policy(
+        env: Env,
+        merchant: Address,
+        strict: bool,
+    ) -> Result<(), Error> {
+        merchant.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::StrictTierPolicy(merchant), &strict);
+        Ok(())
+    }
+
+    /// Check whether strict tier policy enforcement is enabled for a merchant.
+    ///
+    /// # Arguments
+    /// * `merchant` - The merchant to query.
+    ///
+    /// # Returns
+    /// `true` if strict mode is enabled, `false` otherwise (the default).
+    pub fn get_strict_tier_policy(env: Env, merchant: Address) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::StrictTierPolicy(merchant))
+            .unwrap_or(false)
+    }
+}
+
+mod test;
+mod test_policy;
+mod test_process;
+mod test_rate_limit;
+
+#[cfg(test)]
+mod test_payment_refund_cap;
+
+#[cfg(test)]
+mod test_circuit_breaker;
+
+// #[cfg(test)]
+// mod test_versioning;
+
+#[cfg(test)]
+mod test_batch;
+
+#[cfg(test)]
+mod test_cross_contract;
+
+#[cfg(test)]
+mod test_arbitration_fees;
+
+#[cfg(test)]
+mod test_arbitration_stake;
+
+#[cfg(test)]
+mod test_arbitrator_reputation;
+
+#[cfg(test)]
+mod test_auto_refund;
+
+#[cfg(test)]
+mod test_inheritance;
+
+mod test_customer_history;
+#[cfg(test)]
+mod test_notification_hooks;
+
+#[cfg(test)]
+mod test_arbitration_timeout;
+
+#[cfg(test)]
+mod test_merchant_eligibility;
+
+#[cfg(test)]
+mod test_customer_tier_policy;
+
+#[cfg(test)]
+mod test_voucher_expiry;
+
+#[cfg(test)]
+mod schema_version_test;
+
+#[cfg(test)]
+mod test_merchant_override_and_error_codes;
+
+#[cfg(test)]
+mod test_admin_rotation;
