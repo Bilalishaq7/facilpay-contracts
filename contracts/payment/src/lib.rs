@@ -5456,6 +5456,8 @@ impl PaymentContract {
         metadata: String,
         trial_period_seconds: u64,
     ) -> Result<u64, Error> {
+        Self::require_not_paused(&env, "create_subscription")?;
+        Self::require_merchant_not_paused(&env, &merchant)?;
         customer.require_auth();
 
         if !PaymentContract::is_valid_currency(&currency) {
@@ -5914,6 +5916,8 @@ impl PaymentContract {
         billing_cap: Option<i128>,
         max_units_per_period: Option<u64>,
     ) -> Result<u64, Error> {
+        Self::require_not_paused(&env, "create_metered_subscription")?;
+        Self::require_merchant_not_paused(&env, &merchant)?;
         merchant.require_auth();
 
         let counter: u64 = env
