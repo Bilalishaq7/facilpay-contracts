@@ -1349,6 +1349,9 @@ pub struct MerchantFeeRecord {
     pub total_fees_paid: i128,
     pub total_volume: i128,
     pub fee_tier: FeeTier,
+    /// Volume baseline set on manual tier downgrade; automatic upgrades only
+    /// consider volume earned after this point.
+    pub tier_volume_baseline: i128,
 }
 
 #[derive(Clone)]
@@ -3860,41 +3863,62 @@ impl PaymentContract {
         let escrow_carveout = PaymentContract::get_auto_escrow_carveout(env, &payment);
         let merchant_amount = net_amount - escrow_carveout;
 
-        // Token transfer: net amount from customer to merchant
+        // Pull merchant proceeds into the contract, then honor payout schedule.
         let token_client = token::Client::new(env, &payment.token);
         let contract_address = env.current_contract_address();
 
         token_client.transfer_from(
             &contract_address,
             &payment.customer,
-            &payment.merchant,
+            &contract_address,
             &merchant_amount,
         );
 
+        PaymentContract::settle_or_accumulate(
+            env,
+            payment.merchant.clone(),
+            payment.token.clone(),
+            merchant_amount,
+        )?;
+
+        // Forwarding only applies when funds were paid out immediately.
+        let payout_deferred = env
+            .storage()
+            .instance()
+            .get::<DataKey, PayoutSchedule>(&DataKey::Merchant(
+                MerchantDataKey::PayoutSchedule(payment.merchant.clone()),
+            ))
+            .map(|schedule: PayoutSchedule| {
+                schedule.token == payment.token && schedule.frequency != PayoutFrequency::Immediate
+            })
+            .unwrap_or(false);
+
         // Check if merchant has an active payment forward config
-        if let Ok(forward_config) =
-            PaymentContract::get_forward_config(env.clone(), payment.merchant.clone())
-        {
-            if forward_config.active {
-                // Calculate the forward amount based on forward_bps
-                let forward_amount =
-                    (merchant_amount * (forward_config.forward_bps as i128)) / 10000;
+        if !payout_deferred {
+            if let Ok(forward_config) =
+                PaymentContract::get_forward_config(env.clone(), payment.merchant.clone())
+            {
+                if forward_config.active {
+                    // Calculate the forward amount based on forward_bps
+                    let forward_amount =
+                        (merchant_amount * (forward_config.forward_bps as i128)) / 10000;
 
-                // Transfer the forward amount from merchant to forward_to address
-                if forward_amount > 0 {
-                    token_client.transfer(
-                        &payment.merchant,
-                        &forward_config.forward_to,
-                        &forward_amount,
-                    );
+                    // Transfer the forward amount from merchant to forward_to address
+                    if forward_amount > 0 {
+                        token_client.transfer(
+                            &payment.merchant,
+                            &forward_config.forward_to,
+                            &forward_amount,
+                        );
 
-                    (PaymentForwarded {
-                        payment_id,
-                        merchant: payment.merchant.clone(),
-                        forward_to: forward_config.forward_to,
-                        forward_amount,
-                    })
-                    .publish(env);
+                        (PaymentForwarded {
+                            payment_id,
+                            merchant: payment.merchant.clone(),
+                            forward_to: forward_config.forward_to,
+                            forward_amount,
+                        })
+                        .publish(env);
+                    }
                 }
             }
         }
@@ -7534,7 +7558,11 @@ impl PaymentContract {
 
         let mut record =
             PaymentContract::get_or_default_merchant_fee_record(&env, merchant.clone());
-        record.fee_tier = tier;
+        let old_tier = record.fee_tier.clone();
+        record.fee_tier = tier.clone();
+        if PaymentContract::tier_rank(&tier) < PaymentContract::tier_rank(&old_tier) {
+            record.tier_volume_baseline = record.total_volume;
+        }
         env.storage().instance().set(
             &DataKey::Merchant(MerchantDataKey::FeeRecord(merchant)),
             &record,
@@ -7769,6 +7797,7 @@ impl PaymentContract {
                 total_fees_paid: 0,
                 total_volume: 0,
                 fee_tier: FeeTier::Standard,
+                tier_volume_baseline: 0,
             })
     }
 
@@ -7871,7 +7900,10 @@ impl PaymentContract {
 
         // Automatic tier changes are monotonic upgrades only.
         let old_tier = record.fee_tier.clone();
-        let computed_tier = PaymentContract::calculate_tier(env, record.total_volume);
+        let volume_for_tier = record
+            .total_volume
+            .saturating_sub(record.tier_volume_baseline);
+        let computed_tier = PaymentContract::calculate_tier(env, volume_for_tier);
         if PaymentContract::tier_rank(&computed_tier) > PaymentContract::tier_rank(&record.fee_tier)
         {
             record.fee_tier = computed_tier.clone();
