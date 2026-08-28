@@ -260,6 +260,7 @@ pub enum CoreError {
     InvalidFeeConfig = 30,
     InsufficientTreasuryFees = 31,
     AutoApproveThresholdExceedsCeiling = 32,
+    RefundCooldownActive = 33,
 }
 
 #[contracterror]
@@ -2248,12 +2249,24 @@ impl RefundContract {
             return Err(Error::Core(CoreError::Unauthorized));
         }
 
-        let quota = MerchantRefundQuota {
-            merchant: merchant.clone(),
-            limit,
-            period_seconds,
-            used: 0,
-            period_start: env.ledger().timestamp(),
+        let now = env.ledger().timestamp();
+        let quota = match env
+            .storage()
+            .instance()
+            .get::<_, MerchantRefundQuota>(&DataKey::MerchantRefundQuota(merchant.clone()))
+        {
+            Some(mut existing) => {
+                existing.limit = limit;
+                existing.period_seconds = period_seconds;
+                existing
+            }
+            None => MerchantRefundQuota {
+                merchant: merchant.clone(),
+                limit,
+                period_seconds,
+                used: 0,
+                period_start: now,
+            },
         };
         env.storage()
             .instance()
@@ -2705,6 +2718,12 @@ impl RefundContract {
         let token_client = token::Client::new(&env, &fee_token);
         token_client.transfer(&caller, &env.current_contract_address(), &fee_amount);
 
+        let now = env.ledger().timestamp();
+        let timeout_secs: u64 = env
+            .storage()
+            .instance()
+            .get(&ArbitrationKey::ArbitrationTimeoutConfig)
+            .unwrap_or(86400 * 14); // default 14 days
         let case = ArbitrationCase {
             case_id,
             refund_id,
@@ -2712,17 +2731,10 @@ impl RefundContract {
             votes_for_refund: 0,
             votes_against_refund: 0,
             status: ArbitrationStatus::Open,
-            created_at: env.ledger().timestamp(),
-            deadline: env.ledger().timestamp() + 86400 * 7, // 7 days example
+            created_at: now,
+            deadline: now + timeout_secs,
             fee_pool: fee_amount,
-            timeout_at: {
-                let timeout_secs: u64 = env
-                    .storage()
-                    .instance()
-                    .get(&ArbitrationKey::ArbitrationTimeoutConfig)
-                    .unwrap_or(86400 * 14); // default 14 days
-                env.ledger().timestamp() + timeout_secs
-            },
+            timeout_at: now + timeout_secs,
             default_favor_customer: true,
         };
 
@@ -3091,8 +3103,8 @@ impl RefundContract {
     /// their stake just because a case was resolved by timeout instead of vote.
     ///
     /// * `approved` - whether the arbitration outcome favors the customer
-    ///   (refund approved). The staker is the party that escalated the case
-    ///   (the merchant), so they "won" iff the outcome is NOT approved.
+    ///   (refund approved). The staker is whichever party escalated the case;
+    ///   compare their role against the outcome to decide if they won.
     fn settle_arbitration_stake(env: &Env, case_id: u64, approved: bool) {
         let stake_opt: Option<ArbitrationStake> = env
             .storage()
@@ -3102,6 +3114,24 @@ impl RefundContract {
         let mut stake = match stake_opt {
             Some(s) if !s.returned => s,
             _ => return,
+        };
+
+        let case: ArbitrationCase = match env
+            .storage()
+            .instance()
+            .get(&ArbitrationKey::ArbitrationCase(case_id))
+        {
+            Some(c) => c,
+            None => return,
+        };
+
+        let refund: Refund = match env
+            .storage()
+            .instance()
+            .get(&DataKey::Refund(case.refund_id))
+        {
+            Some(r) => r,
+            None => return,
         };
 
         let stake_config: Option<ArbitrationStakeConfig> = env
@@ -3122,11 +3152,9 @@ impl RefundContract {
             .instance()
             .get(&ArbitrationKey::ArbitrationFeeConfig);
 
-        // Determine if staker won or lost
-        // Staker is the one who escalated (usually merchant after rejection)
-        // If refund is approved, staker (merchant) lost
-        // If refund is rejected (stays rejected), staker (merchant) won
-        let staker_won = !approved;
+        // Staker wins when the outcome aligns with their side of the dispute.
+        let staker_won = (stake.staker == refund.customer && approved)
+            || (stake.staker == refund.merchant && !approved);
 
         if staker_won {
             // Return stake to staker
@@ -5432,6 +5460,8 @@ impl RefundContract {
             return Err(Error::Core(CoreError::RefundExceedsPayment));
         }
 
+        Self::check_customer_refund_cooldown(&env, &customer)?;
+
         if payment_id == 0 {
             return Err(Error::Core(CoreError::InvalidPaymentId));
         }
@@ -6745,6 +6775,79 @@ impl RefundContract {
         }
     }
 
+    /// Set the per-customer refund cooldown configuration.
+    ///
+    /// # Arguments
+    /// * `admin` - The contract admin setting the configuration.
+    /// * `config` - Cooldown duration and enable flag.
+    ///
+    /// # Errors
+    /// Returns `Unauthorized` if the caller is not the contract admin.
+    pub fn set_refund_cooldown_config(
+        env: Env,
+        admin: Address,
+        config: RefundCooldownConfig,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::Core(CoreError::Unauthorized))?;
+        if admin != stored_admin {
+            return Err(Error::Core(CoreError::Unauthorized));
+        }
+        env.storage()
+            .instance()
+            .set(&SystemKey::RefundCooldownConfig, &config);
+        Ok(())
+    }
+
+    /// Returns the configured per-customer refund cooldown, if any.
+    pub fn get_refund_cooldown_config(env: Env) -> Option<RefundCooldownConfig> {
+        env.storage()
+            .instance()
+            .get(&SystemKey::RefundCooldownConfig)
+    }
+
+    fn check_customer_refund_cooldown(env: &Env, customer: &Address) -> Result<(), Error> {
+        let config: RefundCooldownConfig = match env
+            .storage()
+            .instance()
+            .get(&SystemKey::RefundCooldownConfig)
+        {
+            Some(c) if c.enabled => c,
+            _ => return Ok(()),
+        };
+
+        let record: CustomerRefundCooldown = match env
+            .storage()
+            .instance()
+            .get(&SystemKey::CustomerRefundCooldown(customer.clone()))
+        {
+            Some(r) => r,
+            None => return Ok(()),
+        };
+
+        let now = env.ledger().timestamp();
+        let elapsed = now.saturating_sub(record.last_refund_requested_at);
+        if elapsed < record.cooldown_seconds {
+            let available_at = record
+                .last_refund_requested_at
+                .saturating_add(record.cooldown_seconds);
+            RefundCooldownEnforced {
+                customer: customer.clone(),
+                last_refund_at: record.last_refund_requested_at,
+                cooldown_seconds: record.cooldown_seconds,
+                available_at,
+            }
+            .publish(env);
+            return Err(Error::Core(CoreError::RefundCooldownActive));
+        }
+
+        Ok(())
+    }
+
     fn update_customer_refund_cooldown(env: &Env, customer: &Address) -> Result<(), Error> {
         let config: RefundCooldownConfig = match env
             .storage()
@@ -7656,7 +7759,16 @@ impl RefundContract {
             .instance()
             .set(&RefundExtKey::AssignmentConfig, &config);
 
-        let _ = case_id;
+        let mut case: ArbitrationCase = env
+            .storage()
+            .instance()
+            .get(&ArbitrationKey::ArbitrationCase(case_id))
+            .ok_or(Error::Core(CoreError::RefundNotFound))?;
+        case.arbitrators = panel.clone();
+        env.storage()
+            .instance()
+            .set(&ArbitrationKey::ArbitrationCase(case_id), &case);
+
         Ok(panel)
     }
 
@@ -8701,6 +8813,7 @@ mod test_arbitration_fees;
 
 #[cfg(test)]
 mod test_arbitration_stake;
+mod test_refund_cooldown;
 
 #[cfg(test)]
 mod test_arbitrator_reputation;
