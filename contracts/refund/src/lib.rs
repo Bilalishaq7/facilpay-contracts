@@ -2249,12 +2249,24 @@ impl RefundContract {
             return Err(Error::Core(CoreError::Unauthorized));
         }
 
-        let quota = MerchantRefundQuota {
-            merchant: merchant.clone(),
-            limit,
-            period_seconds,
-            used: 0,
-            period_start: env.ledger().timestamp(),
+        let now = env.ledger().timestamp();
+        let quota = match env
+            .storage()
+            .instance()
+            .get::<_, MerchantRefundQuota>(&DataKey::MerchantRefundQuota(merchant.clone()))
+        {
+            Some(mut existing) => {
+                existing.limit = limit;
+                existing.period_seconds = period_seconds;
+                existing
+            }
+            None => MerchantRefundQuota {
+                merchant: merchant.clone(),
+                limit,
+                period_seconds,
+                used: 0,
+                period_start: now,
+            },
         };
         env.storage()
             .instance()
@@ -2706,6 +2718,12 @@ impl RefundContract {
         let token_client = token::Client::new(&env, &fee_token);
         token_client.transfer(&caller, &env.current_contract_address(), &fee_amount);
 
+        let now = env.ledger().timestamp();
+        let timeout_secs: u64 = env
+            .storage()
+            .instance()
+            .get(&ArbitrationKey::ArbitrationTimeoutConfig)
+            .unwrap_or(86400 * 14); // default 14 days
         let case = ArbitrationCase {
             case_id,
             refund_id,
@@ -2713,17 +2731,10 @@ impl RefundContract {
             votes_for_refund: 0,
             votes_against_refund: 0,
             status: ArbitrationStatus::Open,
-            created_at: env.ledger().timestamp(),
-            deadline: env.ledger().timestamp() + 86400 * 7, // 7 days example
+            created_at: now,
+            deadline: now + timeout_secs,
             fee_pool: fee_amount,
-            timeout_at: {
-                let timeout_secs: u64 = env
-                    .storage()
-                    .instance()
-                    .get(&ArbitrationKey::ArbitrationTimeoutConfig)
-                    .unwrap_or(86400 * 14); // default 14 days
-                env.ledger().timestamp() + timeout_secs
-            },
+            timeout_at: now + timeout_secs,
             default_favor_customer: true,
         };
 
@@ -7748,7 +7759,16 @@ impl RefundContract {
             .instance()
             .set(&RefundExtKey::AssignmentConfig, &config);
 
-        let _ = case_id;
+        let mut case: ArbitrationCase = env
+            .storage()
+            .instance()
+            .get(&ArbitrationKey::ArbitrationCase(case_id))
+            .ok_or(Error::Core(CoreError::RefundNotFound))?;
+        case.arbitrators = panel.clone();
+        env.storage()
+            .instance()
+            .set(&ArbitrationKey::ArbitrationCase(case_id), &case);
+
         Ok(panel)
     }
 
