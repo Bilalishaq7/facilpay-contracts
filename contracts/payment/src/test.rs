@@ -172,6 +172,37 @@ fn test_trigger_advances_period_and_resets_accumulated() {
 }
 
 #[test]
+fn test_complete_payment_honors_payout_schedule() {
+    let env = Env::default();
+    let (client, admin, contract_id) = setup_rate_limit_contract(&env);
+
+    let customer = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+    token::StellarAssetClient::new(&env, &token).mint(&customer, &250);
+    token::Client::new(&env, &token).approve(&customer, &contract_id, &250, &10000);
+
+    client.set_payout_schedule(&merchant, &PayoutFrequency::Daily, &token);
+
+    let payment_id = client.create_payment(
+        &customer,
+        &merchant,
+        &250,
+        &token,
+        &Currency::USDC,
+        &0,
+        &String::from_str(&env, ""),
+    );
+    client.complete_payment(&admin, &payment_id);
+
+    assert_eq!(client.get_accumulated_balance(&merchant), 250);
+    assert_eq!(token::Client::new(&env, &token).balance(&merchant), 0);
+}
+
+#[test]
 #[should_panic]
 fn test_rate_limit_exceeded_within_window() {
     let env = Env::default();
@@ -5472,7 +5503,7 @@ fn test_manual_override_allows_downgrade() {
     client.manually_set_merchant_tier(&admin, &merchant, &FeeTier::Standard);
     assert_eq!(client.get_merchant_tier(&merchant), FeeTier::Standard);
 
-    // Subsequent completion can auto-upgrade back up based on cumulative volume.
+    // Subsequent completion should not auto-upgrade while volume stays below baseline.
     let second = client.create_payment(
         &customer,
         &merchant,
@@ -5483,7 +5514,7 @@ fn test_manual_override_allows_downgrade() {
         &String::from_str(&env, ""),
     );
     client.complete_payment(&admin, &second);
-    assert_eq!(client.get_merchant_tier(&merchant), FeeTier::Enterprise);
+    assert_eq!(client.get_merchant_tier(&merchant), FeeTier::Standard);
 }
 
 #[test]

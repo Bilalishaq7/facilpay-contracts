@@ -5,13 +5,11 @@ This contract manages secure, conditional fund holding for the Facil-Pay ecosyst
 ## Public Functions
 
 - create_escrow: Initializes a new escrow agreement with locked funds, terms, and designated participants.
-- 
-elease_escrow: Releases the held funds to the recipient once the agreed-upon conditions are successfully met.
+- release_escrow: Releases the held funds to the recipient once the agreed-upon conditions are successfully met.
 - dispute_escrow: Flags the escrow transaction for administrative arbitration if participants cannot reach a consensus.
 - clawback: Reverts the funds back to the original sender if the escrow conditions expire or fundamentally fail.
-- pprove_multisig: Records an approval signature from a required participant for multi-signature escrow setups.
-- dd_observer: Assigns a read-only role to a specific address for auditing and compliance tracking.
-## Escalation timeout vs. appeal expiry
+- approve_multisig: Records an approval signature from a required participant for multi-signature escrow setups.
+- add_observer: Assigns a read-only role to a specific address for auditing and compliance tracking.
 
 The escrow dispute flow has two separate timeout paths, and they apply in different dispute rounds.
 
@@ -19,5 +17,98 @@ The escrow dispute flow has two separate timeout paths, and they apply in differ
 - Appeal expiry applies only after the dispute has entered the Appeal round. An appeal can be filed only while the dispute round is not Final and the time since `dispute_started_at` is still within the 72-hour appeal window. The appeal stores `appeal_deadline = filed_at + 259200`, and if that deadline passes without a resolution, `expire_appeal` rejects the pending appeal, advances the dispute round to Final, and leaves the prior outcome as the effective final disposition.
 
 These are distinct timers rather than one combined timeout. Escalation timeout is measured from the escalation timestamp on a disputed escrow, while appeal expiry is measured from the appeal filing deadline in the Appeal round. In practice, they are not both expected to fire for the same dispute state: the escalation path resolves the Disputed state before a valid appeal round is entered, and the appeal-expiry path only exists once an appeal has already been filed.
+---
+
+## Sub-Accounts
+
+Sub-accounts allow a merchant to split a single escrow into smaller, independently releasable allocations. Each sub-account represents a designated portion of the parent escrow's funds that can be released to the merchant on its own schedule, without requiring the entire escrow to be released at once.
+
+### What a Sub-Account Represents
+
+A sub-account is a child record of an existing escrow. It holds:
+
+- An **amount** — the portion of the parent escrow's funds allocated to this sub-account
+- A **label hash** — a 32-byte identifier for off-chain categorisation (e.g. milestone ID, deliverable reference)
+- A **released** flag — whether funds have been transferred to the merchant
+- An optional **fee override** — a per-sub-account fee in basis points that overrides the parent escrow's fee
+
+Sub-accounts do **not** store a customer or merchant address directly. The merchant is inherited from the parent escrow at call time. The customer has no role in sub-account operations; all customer interaction happens at the parent escrow level.
+
+### Creating a Sub-Account
+
+Only the **merchant** of the parent escrow can create sub-accounts:
+
+```
+create_sub_account(merchant, escrow_id, label_hash, amount, fee_bps_override) -> sub_id
+```
+
+- `merchant` must be the same address stored on the parent escrow (enforced via `require_auth` and address check)
+- The combined allocation of all sub-accounts (including the new one) must not exceed the parent escrow's locked amount — creating a sub-account that would over-allocate returns `SubAccountFundingExceedsEscrow`
+- `fee_bps_override` is optional: `None` inherits the parent escrow's fee; `Some(0)` means zero fees on this sub-account; `Some(1000)` means a 10% fee
+- Sub-accounts are assigned sequential IDs per escrow (starting at 1) and **cannot be deleted** once created
+
+### Funding a Sub-Account
+
+After creation, a sub-account's allocation can be increased:
+
+```
+fund_sub_account(funder, escrow_id, sub_id, amount)
+```
+
+- Any address can fund a sub-account (the `funder` must authorize the call)
+- The total allocation across all sub-accounts is re-validated against the parent escrow amount on every funding call
+- Returns `SubAccountFundingExceedsEscrow` if the increase would exceed the parent escrow
+
+### Releasing a Sub-Account
+
+Only the **admin** can release a sub-account:
+
+```
+release_sub_account(admin, escrow_id, sub_id)
+```
+
+- Transfers funds from the sub-account to the merchant, minus any applicable fee
+- The effective fee is resolved as: `sub.fee_bps_override.unwrap_or(parent_escrow.fee_bps)`
+- The fee portion is sent to the configured `fee_recipient`; the remainder goes to the merchant
+- After release, `sub.released` is set to `true` — a released sub-account **cannot be released again** (`SubAccountAlreadyReleased`)
+
+### Parent Escrow Release Guard
+
+The parent escrow **cannot be released** while any sub-account remains unreleased. The `release_escrow` function checks all sub-accounts and returns `InvalidStatus` if any sub-account has `released == false`.
+
+This enforces the invariant that all sub-accounts must be individually resolved before the parent escrow can be fully released. The typical workflow is:
+
+1. Create escrow with locked funds
+2. Create sub-accounts for each milestone/deliverable
+3. Admin releases each sub-account as milestones are completed
+4. Once all sub-accounts are released, the parent escrow can be released (if any remainder exists)
+
+### Fee Override
+
+Each sub-account can override the parent escrow's fee independently:
+
+```
+set_sub_account_fee_override(merchant, escrow_id, sub_id, fee_bps_override)
+```
+
+- Only the escrow's merchant can call this
+- The sub-account must not already be released
+- `fee_bps_override` can be `None` (inherit parent fee) or `Some(value)` (use `value` as the fee in basis points)
+
+### Queries
+
+| Function                                          | Returns                                        |
+| ------------------------------------------------- | ---------------------------------------------- |
+| `get_sub_account(escrow_id, sub_id)`              | `Option<EscrowSubAccount>` — a single record   |
+| `list_sub_accounts(escrow_id)`                    | `Vec<EscrowSubAccount>` — all sub-accounts     |
+
+### Error Codes
+
+| Error                                | Code | Meaning                                                              |
+| ------------------------------------ | ---- | -------------------------------------------------------------------- |
+| `SubAccountNotFound`                | 214  | No sub-account exists for the given escrow/sub ID pair               |
+| `SubAccountAlreadyReleased`         | 215  | Attempted to release or modify a sub-account that was already released |
+| `SubAccountFundingExceedsEscrow`    | 216  | Total sub-account allocations would exceed the parent escrow amount  |
+
 ---
 [⬅ Back to Main README](../../README.md)
