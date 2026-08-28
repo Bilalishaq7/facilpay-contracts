@@ -347,6 +347,122 @@ Once the case is open, the registered arbitrator panel can vote on whether the r
 
 If the case is not resolved before its timeout window, it falls back to the configured default outcome rather than remaining indefinitely open. That timeout path still settles the stake so the funds do not remain locked up. Arbitration reputation is tracked alongside each case as well: a vote aligned with the final outcome improves an arbitrator's score, while a minority vote lowers it, and the contract also records total cases and average resolution time.
 
+---
+
+## 🔒 Arbitration Stake Requirement
+
+### Overview & Purpose
+
+To discourage frivolous dispute escalations and ensure escalating parties have financial commitment ("skin in the game"), the refund contract supports a configurable staking/bonding requirement. When enabled by the contract admin, any party escalating a refund dispute to arbitration must deposit a designated token stake in addition to the case fee pool. The contract holds this stake in escrow for the duration of the arbitration proceedings.
+
+### Stake Amount & Configuration
+
+Arbitration staking is configured globally by the contract admin via `set_arbitration_stake_config(admin, config)`:
+
+```rust
+pub struct ArbitrationStakeConfig {
+    pub token: Address,   // Token contract address used for staking
+    pub amount: i128,      // Required stake amount per case (must be > 0 when enabled)
+    pub enabled: bool,     // Toggle flag enabling or disabling the stake requirement
+}
+```
+
+| Field | Type | Description |
+| :--- | :--- | :--- |
+| `token` | `Address` | Stellar token address in which the stake must be denominated. |
+| `amount` | `i128` | Required stake amount per case. Must be strictly positive (`> 0`) when `enabled` is `true`. |
+| `enabled` | `bool` | Enables (`true`) or disables (`false`) the stake deposit requirement on arbitration escalation. |
+
+#### Configuration Rules & Behavior
+
+- **Validation**: When `enabled: true`, setting `amount <= 0` will revert with `CoreError::InvalidAmount`.
+- **Admin Authorization**: Only the contract admin can set or update the stake configuration via `set_arbitration_stake_config()`.
+- **Disabled/Unconfigured Staking**: If staking is not configured or `enabled: false`, disputes can be escalated without transferring any stake, and no stake record is stored (`get_arbitration_stake(case_id)` returns `None`).
+- **Querying Config**: The current configuration can be retrieved via `get_arbitration_stake_config()`.
+
+### Stake Lifecycle
+
+```
+                  ┌──────────────────────────────┐
+                  │   escalate_to_arbitration    │
+                  │   (Staking enabled by admin) │
+                  └──────────────┬───────────────┘
+                                 │
+                     [StakeDeposited Event]
+                     [Held in Contract Escrow]
+                                 │
+                  ┌──────────────┴───────────────┐
+                  ▼                              ▼
+        [close_arbitration_case]      [trigger_arbitration_timeout]
+        (Quorum reached & decided)    (Timeout deadline exceeded)
+                  │                              │
+         ┌────────┴────────┐            ┌────────┴────────┐
+         ▼                 ▼            ▼                 ▼
+    Staker Won        Staker Lost  Staker Won        Staker Lost
+   (!approved)        (approved)   (!default)        (default)
+         │                 │            │                 │
+         ▼                 ▼            ▼                 ▼
+   [StakeReturned]  [StakeForfeited][StakeReturned]  [StakeForfeited]
+   (Transferred to  (Transferred to (Transferred to  (Transferred to
+       staker)          treasury)       staker)          treasury)
+```
+
+### Deposit Conditions
+
+When `escalate_to_arbitration(caller, refund_id, token, fee_pool)` is executed:
+1. The contract checks if `ArbitrationStakeConfig` is present in instance storage and `enabled == true`.
+2. If enabled, the contract transfers `config.amount` of `config.token` from the caller (`staker`) into the contract's escrow address.
+3. An `ArbitrationStake` record is created and stored under `ArbitrationKey::ArbitrationStake(case_id)`:
+   - `case_id`: Unique identifier for the arbitration case.
+   - `staker`: Address of the party who deposited the stake.
+   - `amount`: Quantity of tokens held in escrow.
+   - `deposited_at`: Ledger timestamp at deposit.
+   - `returned`: Set to `false`.
+4. A `StakeDeposited` event (`case_id`, `staker`, `amount`) is emitted.
+
+### Return Conditions
+
+The full escrowed stake amount is returned to the original `staker` under the following conditions:
+
+1. **Dispute Decided in Staker's Favor**: When the case is closed via `close_arbitration_case()` and the arbitrator panel's majority vote supports the staker's position (e.g. `!approved` when the merchant escalated to uphold a refund rejection):
+   - The contract transfers `stake.amount` of `config.token` from escrow back to `stake.staker`.
+   - Emits a `StakeReturned { case_id, winner: stake.staker, amount }` event.
+   - Updates `stake.returned` to `true`.
+2. **Timeout Decided in Staker's Favor**: When an overdue dispute is settled via `trigger_arbitration_timeout()` and the default outcome results in the staker winning (i.e. `default_outcome == false`):
+   - The contract transfers `stake.amount` back to `stake.staker`.
+   - Emits `StakeReturned { case_id, winner: stake.staker, amount }`.
+   - Updates `stake.returned` to `true`.
+3. **Missing Treasury Fallback**: If forfeiture conditions are met but no `treasury_address` is configured in `ArbitrationFeeConfig`, the stake falls back to being returned to the `staker` to avoid permanently locked funds.
+
+### Forfeiture Conditions
+
+The deposited stake is forfeited and transferred to the protocol treasury under the following conditions:
+
+1. **Dispute Decided Against Staker**: When the case is closed via `close_arbitration_case()` and the majority vote goes against the staker (e.g. `approved == true`, overturning the merchant's rejection and ordering a refund):
+   - The contract transfers `stake.amount` of `config.token` to the configured `treasury_address` (from `ArbitrationFeeConfig`).
+   - Emits a `StakeForfeited { case_id, loser: stake.staker, amount }` event.
+   - Updates `stake.returned` to `true` (indicating the stake is settled).
+2. **Timeout Decided Against Staker**: When `trigger_arbitration_timeout()` executes for an unresolved case and the default outcome goes against the staker (i.e. `default_outcome == true`):
+   - The contract transfers `stake.amount` to `treasury_address`.
+   - Emits `StakeForfeited { case_id, loser: stake.staker, amount }`.
+   - Updates `stake.returned` to `true`.
+
+### Stake Queries & Data Structures
+
+- `get_arbitration_stake(case_id)` — Returns the `Option<ArbitrationStake>` for a given arbitration case:
+
+```rust
+pub struct ArbitrationStake {
+    pub case_id: u64,         // Arbitration case ID
+    pub staker: Address,       // Address of the depositing party
+    pub amount: i128,          // Amount deposited
+    pub deposited_at: u64,     // Timestamp when stake was locked
+    pub returned: bool,        // True if returned to staker or forfeited to treasury
+}
+```
+
+- `get_arbitration_stake_config()` — Returns the active `Option<ArbitrationStakeConfig>`.
+
 ## 🔗 Links
 
 - [Root README](../../README.md)
