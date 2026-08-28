@@ -89,6 +89,53 @@ The payment contract is the core of the FacilPay platform. It handles the full l
 | `get_escrowed_payment(payment_id)`                                                                | Retrieve the `EscrowedPayment` record.                               |
 | `get_escrowed_payment_dispute(payment_id)`                                                        | Retrieve the active dispute record for an escrowed payment.          |
 
+### Cross-Contract Escrow Verification
+
+The payment contract interacts with the escrow contract through Soroban cross-contract invocations. These calls fall into two categories: **state-mutating bridge calls** (create, release, refund, dispute) and **read-only verification calls** that inspect escrow state without modifying it.
+
+#### What the Payment Contract Verifies
+
+When the payment contract calls into the escrow contract, it queries the following state through the escrow's state verification interface:
+
+| Verification Call                   | What It Returns                                                              | Payment-Side Usage                                                                 |
+| ----------------------------------- | ---------------------------------------------------------------------------- | ---------------------------------------------------------------------------------- |
+| `is_escrow_released(escrow_id)`     | `true` if the escrow exists and its status is `Released`, `false` otherwise  | Confirm escrow funds were released before marking an escrowed payment as completed  |
+| `is_escrow_disputed(escrow_id)`     | `true` if the escrow exists and its status is `Disputed`, `false` otherwise  | Check whether a dispute is active on the escrow                                     |
+| `get_escrow_status(escrow_id)`      | Current `EscrowStatus` (`Locked`, `Released`, `Disputed`, `Refunded`, etc.)  | Validate escrow state before advancing payment lifecycle                            |
+| `get_escrow_parties(escrow_id)`     | `(customer, merchant)` address pair                                           | Confirm payment and escrow parties match                                            |
+| `get_escrow_amount(escrow_id)`      | Locked amount (`i128`)                                                       | Verify the escrowed amount matches the payment amount                               |
+| `verify_escrow_participant(addr)`   | `true` if `address` is the customer or merchant of the escrow                | Gate caller permissions for dispute/cancel operations                               |
+
+#### State-Mutating Bridge Calls
+
+The payment contract also calls escrow functions that modify state. These are routed through internal helpers (`invoke_escrow_create`, `try_release_escrow`, `try_refund_escrow`, `try_dispute_escrow`, `try_resolve_dispute`) which wrap the `EscrowContractClient`.
+
+For `complete_escrowed_payment`, the payment contract calls `release_escrow` using its **own contract address** as the caller. This works because the escrow contract admin registers the payment contract as a **trusted bridge** (via `add_trusted_bridge`), which bypasses the escrow admin early-release timelock. If the payment contract is not registered as a trusted bridge, `release_escrow` reverts with an auth or timelock error.
+
+#### Failure Modes
+
+| Failure Scenario                                              | Error Returned by Payment Contract                         | Details                                                                 |
+| ------------------------------------------------------------- | ---------------------------------------------------------- | ----------------------------------------------------------------------- |
+| Escrow contract address not set / unreachable                 | `FeatureError::EscrowBridgeFailed` (501)                   | Cross-contract `invoke` fails; the payment contract cannot reach escrow |
+| Escrow ID does not exist on escrow contract                   | `EscrowError::NotFound` (200) propagated through bridge   | `get_escrow_status`, `get_escrow_parties`, `get_escrow_amount` return `NotFound`; boolean checks return `false` |
+| Payment contract not registered as trusted bridge             | `FeatureError::EscrowBridgeFailed` (501)                   | `release_escrow` / `complete_escrowed_payment` reverts — admin must call `add_trusted_bridge` on the escrow contract |
+| Escrow in wrong state for requested action                    | `EscrowError::InvalidStatus` (201) propagated through bridge | e.g. attempting to release an already-refunded escrow                 |
+| Release timelock has not elapsed and caller is not a trusted bridge | `EscrowError::ReleaseOnHoldPeriod` (205)              | Early release blocked; the caller must be a registered trusted bridge  |
+| No `EscrowedPayment` mapping found for a `payment_id`         | `FeatureError::EscrowMappingNotFound` (500)                | Payment-side lookup — the escrow contract was never linked to this payment |
+| Active unresolved dispute blocks completion/cancellation       | Internal guard in `require_no_unresolved_escrowed_payment_dispute` | Not an escrow error; the payment contract itself rejects the call   |
+
+All cross-contract bridge failures are normalised to `FeatureError::EscrowBridgeFailed` at the payment contract boundary. Callers should inspect the error code and, if needed, query the escrow contract directly for more granular diagnostics via the read-only verification interface.
+
+#### Test Coverage
+
+The cross-contract verification flow is exercised by `test_cross_contract_escrow_verification.rs`, which registers both the payment and escrow contracts in a shared Soroban test environment and verifies:
+
+- `is_escrow_released` returns `false` before completion and `true` after
+- `get_escrow_status` transitions from `Locked` to `Released`
+- `get_escrow_parties` matches the original payment parties
+- `get_escrow_amount` matches the escrowed amount
+- `verify_escrow_participant` correctly identifies customers, merchants, and non-participants
+
 ### Conditional Payments
 
 | Function                                                                                       | Description                                                                       |
