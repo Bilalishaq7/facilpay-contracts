@@ -1,4 +1,4 @@
-﻿# Escrow Contract
+# Escrow Contract
 
 This contract manages secure, conditional fund holding for the Facil-Pay ecosystem, ensuring assets are only released when agreed-upon conditions are met by all parties.
 
